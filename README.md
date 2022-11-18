@@ -6,7 +6,6 @@ To build:
 ## My WIP little inefficient and ok DE fractal ray tracer (could be better ofc lol)
 ### `This was not designed to be perfectly user friendly but just for me to play around with`
 
-# Please do not fork this repo, but instead try and help improve this program. :)
 -- --
 ![](https://cdn.discordapp.com/attachments/896508127778832384/1043257118465196162/image.png)
 ![](https://cdn.discordapp.com/attachments/861404116860796948/1040391944339206154/image.png)
