@@ -1,0 +1,1635 @@
+
+
+__constant sampler_t sampler_const =
+    CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_NONE | CLK_FILTER_NEAREST;
+
+typedef struct mat3 {
+  float3 r1;
+  float3 r2;
+  float3 r3;
+} mat3;
+
+typedef struct material {
+  int texture;
+  float roughness;
+  float metallic;
+  float4 emissive;
+  float4 specular;
+  float4 diffuse;
+  float ior;
+} material_t;
+
+typedef struct Object {
+  int type;
+  float3 pos;
+  float4 options;
+  material_t mat;
+} object_t;
+
+object_t init_obj(int type, float3 pos, float4 options, material_t mat) {
+  return (object_t){type, pos, options, mat};
+}
+
+typedef struct hit_info {
+  object_t object;
+  bool hit;
+  float d;
+  float3 fractal_shit;
+  float3 fractal_c;
+  float3 fractal_z;
+  float3 point;
+  float3 norm;
+} hit_info_t;
+
+typedef struct Ray {
+  float3 pos;
+  float3 dir;
+  float4 output;
+  float4 throughput;
+  hit_info_t info;
+} ray_t;
+
+material_t init_mat(float roughness, float metallic, int texture,
+                    float4 emissive, float4 diffuse, float4 specular,
+                    float ior) {
+  return (material_t){texture,  roughness, metallic, emissive,
+                      specular, diffuse,   ior};
+}
+
+ray_t init_ray(float3 pos, float3 dir, float4 output, float4 throughput) {
+  return (ray_t){pos, dir, output, throughput};
+}
+
+typedef struct __attribute__((packed)) input_grid {
+  float r0[8];
+  float r1[8];
+  float r2[8];
+  float r3[8];
+  float r4[8];
+  float r5[8];
+  float r6[8];
+  float r7[8];
+} input_grid_t;
+
+typedef struct __attribute__((packed)) shade_args {
+  int ao_steps;
+  float ao_size;
+  int fake_gi_steps;
+  float fake_gi_size;
+  float fake_gi_falloff_scale;
+  int shadow_steps;
+  int soft_shadow_steps;
+  float soft_shadow_de_scale;
+  float mind;
+  float maxd;
+  float shadow_scale;
+  float soft_shadow_scale;
+  float ambient_light_scale;
+  float ambient_light_albedo_mix;
+} shade_args_t;
+
+typedef struct __attribute__((packed)) args_t {
+  input_grid_t input_grid;
+  float3 lookat;
+  float3 cam_up;
+  double2 size;
+  double zoom;
+  int limit;
+  float3 origin;
+  double2 julia;
+  double bail;
+  int samples;
+  int target_samples;
+  ulong time;
+  int offset;
+  float2 sb_size;
+  int2 split_pos;
+  float2 split_size;
+  uint systime;
+} args_t;
+
+typedef struct __attribute__((packed)) ray_args_t {
+  float de_exp;
+  float start_dist;
+  float samples_closest_dist;
+  int max_steps;
+  float stop_distance;
+  float epsilon;
+  float max_distance;
+  float ray_step;
+} ray_args_t;
+
+float linear_rgb_c(float v) {
+  if (v <= 0.04045) {
+    return (v / 12.92);
+  } else {
+    return pow((v + 0.005) / 1.055f, 2.4);
+  }
+}
+
+float4 linear_rgb(float4 rgba) {
+  return (float4)(native_powr(rgba.x, 2.2f), native_powr(rgba.y, 2.2f),
+                  native_powr(rgba.z, 2.2f), rgba.w);
+}
+#define R_2_2 1.0f / 2.2f
+float4 srgb_rgb(float3 rgb, float a) {
+  return (float4)(native_powr(rgb.x, R_2_2), native_powr(rgb.y, R_2_2),
+                  native_powr(rgb.z, R_2_2), a);
+}
+
+float4 rgb_to_xyz(float4 rgba) {
+  float3 srgb = linear_rgb(rgba).xyz;
+  return (float4)(dot((float3)(0.4124564, 0.3575761, 0.1804375), srgb),
+                  dot((float3)(0.2126729, 0.7151522, 0.0721750), srgb),
+                  dot((float3)(0.0193339, 0.1191920, 0.9503041), srgb), rgba.w);
+};
+
+float4 xyz_to_rgb(float4 xyz) {
+  return srgb_rgb(
+      (float3)(dot((float3)(3.2404542, -1.5371385, -0.4985314), xyz.xyz),
+               dot((float3)(-0.9692660, 1.8760108, 0.0415560), xyz.xyz),
+               dot((float3)(0.0556434, -0.2040259, 1.0572252), xyz.xyz)),
+      xyz.w);
+};
+
+float mitchell(float x, float b, float c) {
+  float absx = fabs(x);
+  if (absx < 1.0f) {
+    return ((1.0f / 6.0f) *
+            (((12.0f - 9.0f * b - 6.0f * c) * native_powr(absx, 3)) +
+             ((-18.0f + 12.0f * b + 6.0f * c) * x * x) + (6.0f - 2.0f * b)));
+  } else if ((1.0f <= absx) && (absx > 2.0f)) {
+    return ((1.0f / 6.0f) *
+            (((-b - 6.0f * c) * native_powr(absx, 3)) +
+             ((6.0 * b + 30.0f * c) * x * x) + ((-12.0f * b - 48.0f * c) * x) +
+             (8.0f * b + 24.0f * c)));
+  }
+
+  return (0.0f);
+}
+
+float halton(int base, int index) {
+  float result = 0.0;
+  float f = 1.0;
+  while (index > 0) {
+    f = native_divide(f, (float)(base));
+    result += f * (float)(index % base);
+    index = native_divide(index, base);
+  }
+  return result;
+}
+float3 hammersley(ulong s, float n, args_t args) {
+  return (float3)(s / n, halton(2, (int)(s)), halton(3, (int)(s)));
+}
+
+float3 hue_a(float x) {
+  float theta = x * M_PI_F * 2.0f;
+  float r = (native_sin(theta) + 1.0f) * 0.5f;
+  float b = (native_cos(theta) + 1.0f) * 0.5f;
+  float g = (r + b) * 0.5f;
+  return clamp((float3)(r, g, b), 0.0f, 1.0f);
+}
+float3 hue_f(float x) {
+  float theta = x * M_PI_F * 2.0f;
+  float r = (native_sin(theta));
+  float b = (native_cos(theta));
+  float g = (r + b) * 0.5f;
+  return clamp((float3)(r, g, b), 0.0f, 1.0f);
+}
+
+float3 hue_c(float x) {
+  float theta = x * M_PI_F * 2.0f;
+  float r = native_sin(theta);
+  float b = native_cos(theta);
+  float g = (r + b) * 0.5f;
+  return clamp((float3)(r, g, b), 0.f, 1.f);
+}
+
+float3 hue_d(float x) {
+  float theta = x * M_PI_F * 2.0f;
+  float r = native_sin(theta);
+  float b = native_cos(theta);
+  float g = (r + b) * 0.5f;
+  return (1.0f - clamp((float3)(r, g, b), 0.f, 1.f));
+}
+
+float3 hue_b(float x, args_t *args) {
+  float theta = native_powr(x, 1.0f) + M_PI_F;
+  float d = 13.0f / 9.0f;
+  float v = (4.0f * M_PI_F) / 9.0f;
+
+  float r = (native_cos(theta + v - d + args->input_grid.r1[5] +
+                        args->input_grid.r1[7]) +
+             1.0f) *
+            0.5f;
+  float b = (native_sin(theta - v - d + args->input_grid.r1[6] +
+                        args->input_grid.r1[7]) +
+             1.0f) *
+            0.5f;
+  float g = (native_sin(M_PI_4_F + theta + d) * 2.0f + 2.0f) * 0.25f;
+
+  return (float3)(r, g, b);
+}
+
+float4 boxFold(float4 z, float l) {
+  float3 z2 = z.xyz;
+  z2 = clamp(z2, -l, l) * 2.f - z.xyz;
+  return (float4)(z2.x, z2.y, z2.z, z.w);
+}
+float4 ballFold(float4 z, float min_rad, float fixed_rad) {
+  float r2 = dot(z.xyz, z.xyz);
+  if (r2 < min_rad) {
+    return z * (fixed_rad / min_rad);
+  }
+  //
+  else if (r2 < fixed_rad) {
+    return z * (fixed_rad / r2);
+  }
+  return z;
+}
+
+float2 fold(float2 p, float theta) {
+  float2 n = (float2)(cos(-theta), sin(-theta));
+  return p - (2.f * min(0.f, dot(p, n)) * n);
+}
+
+float3 fold_dr(float2 p, float theta, float dr) {
+  float2 n = (float2)(cos(-theta), sin(-theta));
+  float s = 2.f * min(0.f, dot(p, n));
+  float2 np = p - (s * n);
+  return (float3)(np.x, np.y, (1.0f * dr * length(s * n)));
+}
+//.5f*(dr * length((s * n) - p))
+float4 fold3d_dr(float4 p, float3 theta) {
+  float4 np = p;
+  np.xyw = fold_dr(np.xy, theta.x, np.w);
+  np.xzw = fold_dr(np.xz, theta.y, np.w);
+  np.yzw = fold_dr(np.yz, theta.z, np.w);
+  return np;
+}
+
+float3 fold3d(float3 p, float3 theta) {
+  float3 np = p;
+  np.xy = fold(np.xy, theta.x);
+  np.xz = fold(np.xz, theta.y);
+  np.yz = fold(np.yz, theta.z);
+  return np;
+}
+
+float sdfIDFK(float3 c, float r) {
+  return cos(c.x) + sin(c.y) * cos(c.x) + cos(c.z);
+}
+float sdfBox(float3 p, float3 b) {
+  float3 d = fabs(p) - b;
+  return min(max(d.x, max(d.y, d.z)), 0.f) + length(max(d, 0.f));
+}
+float sdfPlane(float3 p, float4 n) { return dot(p, n.xyz) + n.w; }
+float sdfLine(float3 p, float3 a, float3 b, float r) {
+  float3 l = (b - a);
+  float h = max(0.0f, min(1.0f, dot(cos(p - a), l) / dot(l, l)));
+  return length(cos(p - a) - (l)*h) - sin(r / 1.f);
+}
+float sdfSphereHollow(float3 c, float r) { return fabs(r - length(c)); }
+float sdfSphere(float3 c, float r) { return max(0.0f, length(c) - r); }
+float arg3(float3 a, float3 b) {
+  return acos(dot(a, b) / (length(a) * length(b)));
+}
+typedef struct {
+  float de;
+  float3 z;
+  float3 c;
+  float3 i_s_tia;
+} de_out_t;
+float2 get_polar_angles(float3 p) {
+  float theta = atan2(p.z, p.x);
+
+  float phi =
+      acos(native_divide(p.y, native_sqrt(p.x * p.x + p.y * p.y + p.z * p.z)));
+  return (float2)(theta, phi);
+}
+de_out_t mandelbox_DE(ray_t ray, float3 c, float n, args_t *args) {
+
+  float t = 0.f;
+
+  float4 julia = (float4)(args->input_grid.r6[0], args->input_grid.r6[1],
+                          args->input_grid.r6[2], 0.f);
+  float4 offset1 = (float4)(args->input_grid.r4[5], args->input_grid.r4[6],
+                            args->input_grid.r4[7], 0.f);
+  float4 angles1 = (float4)(args->input_grid.r3[5], args->input_grid.r3[6],
+                            args->input_grid.r3[7], 0.f);
+  float3 oc = julia.xyz;
+
+  float4 z = (float4)(c.x, c.y, c.z, 0.0f);
+  float dr = 1.0f;
+  float r = 0.0f;
+  int i = 0;
+  float s2 = 0.0f;
+  float wtf = 0.0f;
+  float mini = INFINITY;
+  float maxi = 0.0f;
+  float3 a = (float3)(0., -0.5, 0.);
+  float sym = 0.75f;
+  float rad = 1.f;
+
+  float tia = 0.0f;
+  float4 c4 = (float4)(oc.x, oc.y, oc.z, 0.0f);
+  float s33 = 0.5f;
+  float scael1 = args->input_grid.r2[1];
+  float scale = args->input_grid.r2[0];
+  float fr = args->input_grid.r3[1];
+  float fr2 = fr * fr;
+  float mr = args->input_grid.r3[0];
+  float mr2 = mr * mr;
+
+  while (i < args->limit) {
+
+    r = length(z.xyz);
+
+    // wtf += 1.0f / r;
+
+    s2 += native_exp(-r);
+    float2 angles = get_polar_angles(z.xyz);
+    // if (i > 0)
+    // tia += 0.5f + 0.5f * cos(angles.x) * sin(angles.y);
+    if (i > 0)
+      tia += 0.5f + 0.5f * cos(angles.x) * sin(angles.y);
+    //	s3 +=
+    z.xyz = fold3d(z.xyz - offset1.xyz, angles1.xyz) + offset1.xyz;
+    z = boxFold(z, args->input_grid.r4[0]);
+    z = ballFold(z, mr, fr);
+
+    z.xyz = scale * z.xyz + oc;
+
+    z.w = z.w * fabs(scale) + 1;
+    // exp(-length(c))
+    i += 1;
+  }
+
+  float m = length(z.xyz);
+  //*z.w
+  float adjust = 1.4f;
+  // float x = (m / fabs(z.w));
+  //  float x = (m / fabs(z.w));
+  // float x =exp((m/r)+1) * (log10(2+m) / (log(r/(scale+1))*fabs(z.w-20)));
+
+  float x = args->input_grid.r7[6] * (m / fabs(z.w)) + args->input_grid.r7[7];
+  // x = x * (1.f - native_powr(2.f, -10000000.f * x));
+  x = x * (1.f - exp(-100000.f * x));
+  return (de_out_t){x, z.xyz, c.xyz, (float3)(i, s2, tia / (i))};
+}
+float box_f(float v) {
+  if (v > 1.0f) {
+    return 2.0f - v;
+  } else if (v < -1.0f) {
+    return -2.0f - v;
+  }
+
+  return v;
+}
+float3 box_fold(float3 z) {
+  return (float3)(box_f(z.x), box_f(z.y), box_f(z.z));
+}
+float3 ball_fold(float r, float3 z) {
+  float l = length(z);
+  if (l < r) {
+    return z / (r * r);
+  } else if (l < 1.0f) {
+    return 1.0f / (l * l);
+  } else {
+    return z;
+  }
+}
+de_out_t mengersponge_de(ray_t ray, float3 c, float n, args_t *args) {
+  float3 z = c * .5f + 0.5f;
+  float3 zz = fabs(z - .5f) - .5f;
+  float d1 = max(zz.x, max(zz.y, zz.z));
+  float d = d1;
+  float p = 1.0f;
+  for (int i = 1; i <= n; ++i) {
+    float3 za = fmod(3.0f * z * p, 3.0f);
+    p *= 3.f;
+
+    zz = 0.5f - fabs(za - 1.5f);
+    d1 = min(min(max(zz.x, zz.z), max(zz.x, zz.y)), max(zz.y, zz.z));
+    d = max(d, d1);
+  }
+  float x = d * 2.f;
+  x = x * (1.f - native_powr(2.f, -100000000.f * x));
+  return (de_out_t){x, z.xyz, c.xyz, (float3)(0.f, 0.f, 0.f)};
+}
+de_out_t bulb_box(ray_t ray, float3 c, float n, args_t *args) {
+  float t = 0.f;
+  float3 oc = c.zyx;
+  float3 julia = (float3)(args->input_grid.r6[0], args->input_grid.r6[1],
+                          args->input_grid.r6[2]);
+  float nx = oc.x * native_cos(t * M_PI_F) - oc.z * native_sin(t * M_PI_F);
+  float nz = oc.x * native_sin(t * M_PI_F) + oc.z * native_cos(t * M_PI_F);
+  oc.x = nx;
+  oc.z = nz;
+
+  float3 z = (float3)(c.x, c.y, c.z);
+  float dr = 1.0f;
+  float r = 0.0f;
+  int i = 0;
+  float s2 = 0.0f;
+  float wtf = 0.0f;
+  float mini = INFINITY;
+  float maxi = 0.0f;
+  float3 a = (float3)(0., -0.5, 0.);
+  float sym = 0.25f;
+  float rad = 1.f;
+  float scale = args->input_grid.r6[3];
+  float tia = 0.0f;
+
+  while (i < args->limit && r < args->bail) {
+
+    // z = fabs(z + a) - a;
+    // z = fabs(z);
+    z = box_fold(2.0f - ball_fold(1.5f, z - c) + c);
+    r = native_sqrt(z.x * z.x + z.y * z.y + z.z * z.z);
+    wtf += native_recip(r);
+    if (r >= args->bail)
+      break;
+    s2 += native_exp(-r);
+
+    float theta = acos(native_divide(z.z, r));
+    float phi = atan2(z.y, z.x);
+    if (i > 0)
+      tia += 0.5f + 0.5f * cos(2.f * theta) * sin(2.f * phi);
+    dr = fma(native_powr(r, n - 1.0f) * n, dr, 1.0f);
+    // dr = dr * (scale) + 1.f;
+    float zr = native_powr(r, n);
+    theta *= n;
+    phi *= n;
+    z = zr * (float3)(native_sin(theta) * native_cos(phi),
+                      native_sin(phi) * native_sin(theta), native_cos(theta));
+    z += c;
+
+    i += 1;
+  }
+
+  float m = dot(z.xyz, z.xyz);
+
+  float x = fabs(native_log(r) * native_divide(r, dr));
+
+  return (de_out_t){x, z.xyz, c.xyz, (float3)(i, s2, tia / (i))};
+}
+
+de_out_t mandelbulb_DE(ray_t ray, float3 c, float n, args_t *args) {
+  float t = 0.f;
+  float3 oc = c.xyz;
+  float3 julia = (float3)(args->input_grid.r6[0], args->input_grid.r6[1],
+                          args->input_grid.r6[2]);
+
+  float3 z = (float3)(oc.x, oc.y, oc.z);
+  // z = (float3)(0.f);
+  float dr = 1.0f;
+  float r = 0.0f;
+  int i = 0;
+  float s2 = 0.0f;
+  float wtf = 0.0f;
+  float mini = INFINITY;
+  float maxi = 0.0f;
+  float3 a = (float3)(0., -0.5, 0.);
+  float sym = 0.25f;
+  float rad = 1.f;
+  float scale = args->input_grid.r6[3];
+  float tia = 0.0f;
+
+  while (i < args->limit && r < args->bail) {
+
+    // z = fabs(z) ;
+    r = native_sqrt(z.x * z.x + z.y * z.y + z.z * z.z);
+
+    wtf += native_recip(r);
+    if (r >= args->bail)
+      break;
+    s2 += native_exp(-r);
+
+    float theta = acos(native_divide(z.z, r));
+    float phi = atan2(z.y, z.x);
+    if (i > 0)
+      tia +=
+          0.5f + 0.5f * cos(1.f * theta) * sin(1.f * phi) * atan2(phi, theta);
+    dr = fma(native_powr(r, n - 1.0f) * n, dr, 1.0f);
+    // dr = dr * (scale) + 1.f;
+    float zr = native_powr(r, n);
+    theta *= n;
+    phi *= n;
+    z = zr * (float3)(native_sin(theta) * native_cos(phi),
+                      native_sin(phi) * native_sin(theta), native_cos(theta));
+    z += oc;
+
+    i += 1;
+  }
+
+  float m = native_sqrt(dot(z.xyz, z.xyz));
+
+  float x = .5f * fabs(native_log(m) * native_divide(m, fabs(dr)));
+
+  return (de_out_t){x, z.xyz, oc.xyz, (float3)(i, s2, tia / (i))};
+}
+
+float arg(float2 z) {
+  if (z.x > 0.0) {
+    return (atan(native_divide(z.y, z.x)));
+  } else if (z.y > 0.0) {
+    return (M_PI_2_F - atan(native_divide(z.x, z.y)));
+  } else if (z.y < 0.0) {
+    return (-M_PI_2_F - atan(native_divide(z.x, z.y)));
+  } else if (z.x < 0.0) {
+    return (atan(native_divide(z.y, z.x)) + M_PI_F);
+  } else {
+    return 0.0;
+  }
+}
+
+uint wang_hash(uint *seed) {
+  *seed = (uint)(*seed ^ (uint)(61)) ^ (uint)(*seed >> (uint)(16));
+  *seed *= (uint)(9);
+  *seed = *seed ^ (*seed >> 4);
+  *seed *= (uint)(0x27d4eb2d);
+  *seed = *seed ^ (*seed >> 15);
+  return *seed;
+}
+
+uint rand_pcg(uint *rng_state) {
+  uint state = *rng_state;
+  *rng_state = *rng_state * 747796405u + 2891336453u;
+  uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+
+float RandomFloat01(uint *state) {
+  return (float)(rand_pcg(state)) / 4294967296.0;
+}
+
+float3 orient_to_norm(float3 dir, float3 n) {
+  float3 nt;
+  if (fabs(n.x) > fabs(n.y)) {
+    nt = normalize((float3)(n.z, 0.f, -n.x));
+  } else {
+    nt = normalize((float3)(0.f, -n.z, n.y));
+  }
+  float3 nb = cross(n, nt);
+  return (float3)(dot(dir, (float3)(nb.x, n.x, nt.x)),
+                  dot(dir, (float3)(nb.y, n.y, nt.y)),
+                  dot(dir, (float3)(nb.z, n.z, nt.z)));
+}
+
+float3 uniform_sphere(uint *state) {
+  float u = RandomFloat01(state);
+  float v = RandomFloat01(state);
+  float theta = 2.f * M_PI_F * u;
+  float phi = acos(2.f * v - 1.f);
+  return (float3)(native_cos(theta) * native_sin(phi),
+                  native_sin(theta) * native_sin(phi), native_cos(phi));
+}
+
+float3 uniform_hemisphere(float cos_theta, uint *state) {
+  float u = cos_theta;
+  float v = RandomFloat01(state);
+  float sint = native_sqrt(1.f - u * u);
+  float phi = 2.f * M_PI_F * v;
+  float x = sint * native_cos(phi);
+  float z = sint * native_sin(phi);
+  return (float3)(x, u, z);
+}
+
+float compute_fresnel_reflect(float n1, float n2, float3 norm, float3 incident,
+                              float f0, float f90) {
+  float r0 = (n1 - n2) / (n1 + n2);
+  r0 *= r0;
+  float cos_x = -dot(norm, incident);
+  if (n1 > n2) {
+    float n = n1 / n2;
+    float sin_t2 = n * n * (1.f - cos_x * cos_x);
+    if (sin_t2 > 1.f)
+      return f90;
+    cos_x = sqrt(1.f - sin_t2);
+  }
+  float x = 1.f - cos_x;
+  float ret = r0 + (1.f - r0) * x * x * x * x * x;
+  return mix(f0, f90, ret);
+}
+
+de_out_t space_fold_DE(ray_t ray, float3 c, float n, args_t *args) {
+  float4 z = (float4)(c, 1.f);
+
+  float scale = args->input_grid.r2[0];
+  float fr = args->input_grid.r3[1];
+  float fr2 = fr * fr;
+  float mr = args->input_grid.r3[0];
+  float mr2 = mr * mr;
+
+  float4 julia = (float4)(args->input_grid.r4[5], args->input_grid.r4[6],
+                          args->input_grid.r4[7], 0.f);
+
+  int i = 0;
+  float s2 = 0.0f;
+  float tia = 0.0f;
+
+  float3 offset = (float3)(args->input_grid.r6[0], args->input_grid.r6[1],
+                           args->input_grid.r6[2]);
+  float3 angles =
+      M_PI_F * (float3)(args->input_grid.r6[3], args->input_grid.r6[4],
+                        args->input_grid.r6[5]);
+  float3 scales = (float3)(args->input_grid.r7[3], args->input_grid.r7[4],
+                           args->input_grid.r7[5]);
+  while (i < args->limit) {
+
+    z.xyz = fold3d(z.xyz * scales, angles) + offset;
+
+    i += 1;
+  }
+  float3 oc = z.xyz;
+  float r = 0.f;
+  for (int i = 0; i < args->input_grid.r0[7] && r < args->bail; i++) {
+
+    float r = length(z.xyz - fabs(c - oc));
+    // if (r > args->bail) break;
+    s2 += native_exp(-r);
+    float theta = acos(native_divide(z.z, r));
+    float phi = atan2(z.y, z.x);
+
+    if (i > 0)
+      tia += 0.5f + 0.5f * cos(1.f * theta) * sin(1.f * phi);
+    z.xyz = fold3d(z.xyz, (float3)(M_PI_F / 6.f, 0.f, 0.f));
+    z = boxFold(z, args->input_grid.r4[0]);
+    z = ballFold(z, mr, fr);
+
+    z = boxFold(z, args->input_grid.r4[1]);
+    z = ballFold(z, args->input_grid.r7[6], args->input_grid.r7[7]);
+    z.xyz = scale * z.xyz + julia.xyz;
+    z.w = z.w * fabs(scale) + 1;
+    /*
+            z.w = fma(native_powr(r, n - 1.0f) * n, z.w, 1.0f);
+        // dr = dr * (scale) + 1.f;
+        float zr = native_powr(r, n);
+        theta *= n;
+        phi *= n;
+        z.xyz = zr * (float3)(native_sin(theta) * native_cos(phi),
+                          native_sin(phi) * native_sin(theta),
+       native_cos(theta)); z.xyz += oc;*/
+  }
+
+  // fabs(sdfBox(z.xyz * args->input_grid.r7[6],
+  // (float3)(args->input_grid.r6[6])) -args->input_grid.r7[7])
+  float m = length(z.xyz);
+  float x2 = (.0075) * m / fabs(z.w);
+  // float x = length(z * args->input_grid.r7[6]) - args->input_grid.r7[7];
+  // float x2 = .25f * fabs(native_log(m) * native_divide(m, fabs(z.w)));
+  x2 = x2 * (1.f - native_exp(-100000000.1f * x2));
+
+  return (de_out_t){x2, z.xyz, c, (float3)(i, s2, tia / (i))};
+}
+
+de_out_t space_fold_DE_super(ray_t ray, float3 c, float n, args_t *args) {
+  float4 z = (float4)(c, 1.f);
+
+  float scale = args->input_grid.r2[0];
+  float fr = args->input_grid.r3[1];
+  float fr2 = fr * fr;
+  float mr = args->input_grid.r3[0];
+  float mr2 = mr * mr;
+
+  float4 julia = (float4)(args->input_grid.r4[5], args->input_grid.r4[6],
+                          args->input_grid.r4[7], 0.f);
+  float3 rfrnc = c;
+
+  int i = 0;
+  float s2 = 0.0f;
+  float tia = 0.0f;
+
+  float3 offset = (float3)(args->input_grid.r6[0], args->input_grid.r6[1],
+                           args->input_grid.r6[2]);
+  float3 angles =
+      M_PI_F * (float3)(args->input_grid.r6[3], args->input_grid.r6[4],
+                        args->input_grid.r6[5]);
+  float3 scales = (float3)(args->input_grid.r7[3], args->input_grid.r7[4],
+                           args->input_grid.r7[5]);
+  while (i < args->limit) {
+
+    z.xyz = fold3d(z.xyz * scales, angles) + offset;
+    rfrnc.xyz = fold3d(rfrnc.xyz * scales, angles) + offset;
+
+    // julia.xyz = fold3d(julia.xyz * scales, angles) + offset;
+    i += 1;
+  }
+  // z.w =  (length(z * args->input_grid.r7[6]) - args->input_grid.r7[7]);
+  float da = (length(z * args->input_grid.r7[6]) - args->input_grid.r7[7]);
+  ;
+  float3 oc = z.xyz;
+  float r = 0.f;
+  float dist = length(oc - rfrnc);
+  for (int i = 0; i < args->input_grid.r0[7]; i++) {
+
+    float r = length(z.xyz - rfrnc);
+
+    s2 += native_exp(-r);
+    float theta = acos(native_divide(z.z, r));
+    float phi = atan2(z.y, z.x);
+
+    if (i > 0)
+      tia += 0.5f + 0.5f * cos(1.f * theta) * sin(1.f * phi);
+    float3 oz = z.xyz;
+
+    z.xyz = fold3d(z.xyz, (float3)(M_PI_F / 6.f, 0, 0));
+
+    z = boxFold(z, args->input_grid.r4[0]);
+    z = ballFold(z, mr, fr);
+    z = boxFold(z, args->input_grid.r4[1]);
+    z = ballFold(z, args->input_grid.r6[6], args->input_grid.r6[7]);
+    z.xyz = scale * z.xyz + julia.xyz * 1000;
+    z.w = z.w * fabs(scale) + 1;
+    /*
+            z.w = fma(native_powr(r, n - 1.0f) * n, z.w, 1.0f);
+        // dr = dr * (scale) + 1.f;
+        float zr = native_powr(r, n);
+        theta *= n;
+        phi *= n;
+        z.xyz = zr * (float3)(native_sin(theta) * native_cos(phi),
+                          native_sin(phi) * native_sin(theta),
+       native_cos(theta)); z.xyz += oc;*/
+  }
+
+  // fabs(sdfBox(z.xyz * args->input_grid.r7[6],
+  // (float3)(args->input_grid.r6[6])) -args->input_grid.r7[7])
+  float m = length(z.xyz);
+  float x2 = args->input_grid.r7[6] * (m / fabs(z.w)) + args->input_grid.r7[7];
+  // float x2 = (length(z * args->input_grid.r7[6]) - args->input_grid.r7[7]);
+  //  float x2 = .25f * fabs(native_log(m) * native_divide(m, fabs(z.w)));
+  x2 = x2 * (1.f - native_exp(-100000.f * x2));
+
+  return (de_out_t){x2, z.xyz, c, (float3)(i, s2, tia / (i))};
+}
+
+float sphere_sdf(float3 p, float3 sphere_p, float radius) {
+  return max(0.f, length(sphere_p - p) - radius);
+}
+de_out_t mandelbox_DE_o(ray_t ray, float3 c, float n, args_t *args) {
+
+  float t = 0.f;
+
+  float4 julia = (float4)(args->input_grid.r6[0], args->input_grid.r6[1],
+                          args->input_grid.r6[2], 0.f);
+  float3 oc = julia.xyz;
+
+  float4 z = (float4)(c.x, c.y, c.z, 0.0f);
+  float dr = 1.0f;
+  float r = 0.0f;
+  int i = 0;
+  float s2 = 0.0f;
+  float wtf = 0.0f;
+  float mini = INFINITY;
+  float maxi = 0.0f;
+  float3 a = (float3)(0., -0.5, 0.);
+  float sym = 0.75f;
+  float rad = 1.f;
+  float scale = args->input_grid.r2[0];
+  float tia = 0.0f;
+  float4 c4 = (float4)(oc.x, oc.y, oc.z, 0.0f);
+  float s33 = 0.5f;
+  float scael1 = args->input_grid.r2[1];
+  float fr = args->input_grid.r3[1];
+  float fr2 = fr * fr;
+  float mr = args->input_grid.r3[0];
+  float mr2 = mr * mr;
+  float de_fact = scale;
+  while (i < args->limit) {
+
+    r = native_sqrt(dot(z, z));
+
+    wtf += 1.0f / r;
+
+    s2 += native_exp(-r);
+    float2 angles = get_polar_angles(z.xyz);
+    // if (i > 0)
+    // tia += 0.5f + 0.5f * cos(angles.x) * sin(angles.y);
+    if (i > 0)
+      tia += 0.5f + 0.5f * cos(angles.x) * sin(angles.y);
+    //	s3 +=
+    z = boxFold(z, args->input_grid.r4[0]);
+    z = ballFold(z, mr, fr);
+    z.xyz = scale * z.xyz + oc;
+
+    z.w = z.w * (scale) + 1.f;
+
+    i += 1;
+  }
+
+  float m = length(z.xyz);
+
+  float adjust = 1.4f;
+  float x = args->input_grid.r7[6] * (m / fabs(z.w)) + args->input_grid.r7[7];
+  x = x * (1.f - native_powr(2.f, -100000.f * x));
+  return (de_out_t){x, z.xyz, c.xyz, (float3)(i, s2, tia / (i))};
+}
+hit_info_t de(ray_t ray, float3 p, object_t *light, object_t *fractal,
+              ray_args_t *ray_args, args_t *args) {
+  hit_info_t info = (hit_info_t){
+      *light, false, ray_args->max_distance, 0.f, (float3)(0.f), (float3)(0.f),
+  };
+  info.d = ray_args->max_distance;
+  info.object = *light;
+  float d = 0.f;
+
+  de_out_t mb = mandelbulb_DE(ray, p, 9.f, args);
+  d = mb.de;
+  if (d < info.d) {
+    info.object = *fractal;
+    info.d = d;
+    info.fractal_shit = mb.i_s_tia;
+    info.fractal_c = mb.c;
+    info.fractal_z = mb.z;
+  }
+  d = fabs(sphere_sdf(p, light->pos, light->options.x));
+  if (d < info.d) {
+    info.object = *light;
+    info.d = d;
+  }
+  info.d *= ray_args->ray_step;
+  return info;
+}
+
+float3 compute_norm(float det, ray_t ray, float3 p, float d, object_t *light,
+                    object_t *fractal, ray_args_t *ray_args, args_t *args) {
+  return normalize(((float3)(de(ray, p + (float3)(det, 0.f, 0.f), light,
+                                fractal, ray_args, args)
+                                 .d,
+                             de(ray, p + (float3)(0.f, det, 0.f), light,
+                                fractal, ray_args, args)
+                                 .d,
+                             de(ray, p + (float3)(0.f, 0.f, det), light,
+                                fractal, ray_args, args)
+                                 .d)) -
+                   d);
+}
+float4 project_to_skybox(ray_t ray, args_t *args,
+                         __read_only image2d_t skybox) {
+  float3 p2 = ray.dir;
+
+  float theta = (acos(p2.y)) / (M_PI_F);
+  float phi = (atan2(p2.x, p2.z) + M_PI_F) / (2.f * M_PI_F);
+  float blur = 0.021f;
+  float4 px = read_imagef(skybox, sampler_const,
+                          args->sb_size * ((float2)(phi, theta)));
+  return px;
+}
+
+/*
+float4 compute_lighting(object_t *light, ray_t reflected, ray_args_t
+*ray_args, shade_args_t *shade_args, float3 p, float3 norm, float3 v, float s,
+args_t *args) { ray_t nr = reflected; nr.dir = normalize(nr.dir - (2.f *
+dot(nr.dir, norm) * norm)); nr.dir = light->pos - p;
+
+  float diffuse =
+  if (1.f - s > 0.f) {
+    float3 light_dir = light.pos - p;
+    float dist = length(light_dir);
+    light_dir /= distance;
+    dist *= dist;
+
+    float ndl = dot(norm, light_dir);
+    float i = max(0.f, min(1.f, ndl));
+
+
+  }
+
+  return i;
+}*/
+
+float saturate(float v) { return max(0.f, min(1.f, v)); }
+
+// [-1, 1]
+float tent_dist(float v) {
+  float o = v * 2.f - 1.f;
+  return max(-1.f, o / native_sqrt(fabs(o))) - sign(o);
+}
+float2 intersect_ray_sphere(float3 origin, float3 ray, float4 *sphere) {
+  float3 c0 = origin - sphere->xyz;
+
+  float a = dot(ray, ray);
+  float b = 2.0 * dot(c0, ray);
+  float c = dot(c0, c0) - sphere->w * sphere->w;
+
+  float ds = b * b - 4.0f * a * c;
+  if (ds < 0.0f) {
+    return (float2)(INFINITY, INFINITY);
+  }
+
+  return (float2)((-b + native_sqrt(ds)) / (2.0f * a),
+                  (-b - native_sqrt(ds)) / (2.0f * a));
+}
+float3 compute_sphere_ray_norm(float3 ro, float3 rd, float4 sphere) {
+  float2 t = fabs(intersect_ray_sphere(ro, rd, &sphere));
+  return normalize(sphere.xyz - (ro + rd * t.x));
+}
+
+// https://learnopengl.com/PBR/Theory
+float distribution_ggx(float3 n, float3 h, float roughness) {
+  float a = roughness * roughness;
+  float a2 = a * a;
+  float ndh = max(dot(n, h), 0.f);
+  float ndh2 = ndh * ndh;
+
+  float denom = (ndh2 * (1.f - a2) + 1.f);
+  denom = (M_PI_F * denom * denom);
+  return a2 / denom;
+}
+
+float geometry_schlick_ggx(float ndv, float roughness) {
+  float r = roughness + 1.f;
+  float k = (r * r) / 8.f;
+  return ndv / ((ndv * (1.f - k)) + k);
+}
+float geometry_smith(float3 n, float3 v, float3 l, float k) {
+  float ndv = max(dot(n, v), 0.f);
+  float ndl = max(dot(n, l), 0.f);
+  return 1.f - (geometry_schlick_ggx(ndv, k) * geometry_schlick_ggx(ndl, k));
+}
+
+float3 fresnel_schlick(float cos_theta, float3 f0) {
+  return f0 + (1.0f - f0) * pow(1.0f - cos_theta, 5.0f);
+}
+float gdtail2(float detail, float x) {
+  return x * (1.f - native_exp(-detail * log(x)));
+}
+float gdtail(float detail, float x) { return detail * (1.f + 50.f * x); }
+float4 render(int2 coord, uint *rng, ray_t ray, object_t *light,
+              object_t *fractal, shade_args_t *shade_args, ray_args_t *ray_args,
+              args_t *args, __read_only image2d_t skybox,
+              __global float *input_depth, __global float *output_depth) {
+  float start_depth = (input_depth[coord.x * coord.y]);
+  float weight = 1.f;
+  float pbounces = 1;
+  float detail = .0000001f;
+  ray.throughput = 1.f;
+  ray.output = 0.00025f;
+  for (int bounce = 0; bounce < pbounces; bounce++) {
+    ray.info.hit = false;
+    float spec_amount = 0.f;
+    float spec_chance = 0.f;
+    float4 albedo = 0.f;
+    float3 norm = 0.f;
+    float3 hit_p = (float3)(100.f);
+    material_t material;
+    ray.info.hit = false;
+    //(bounce == 0) ? start_depth*.9f :
+    float d = .001f;
+    float3 point = ray.pos;
+    float4 diffuse = 0.f;
+    float4 specular = 0.f;
+    float det = detail * (1.f + 10.f * d);
+    // float volume_dist = .0015f;
+    // float volume_power = .25f;
+    float r_dist = args->input_grid.r0[3];
+    float div = native_recip((r_dist + 0.1f) * (r_dist + 0.1f));
+    for (int step = 0; step < ray_args->max_steps; step++) {
+      // volume_dist = .0015f * log10(10.f + d);
+      point = ray.pos + (ray.dir * d);
+      ray.info = de(ray, point, light, fractal, ray_args, args);
+      d += fabs(ray.info.d);
+      det = max(ray_args->stop_distance,
+                min(ray_args->ray_step * 2.f, gdtail(detail, d)));
+      ray.info.hit = false;
+      if (d > ray_args->max_distance) {
+
+        break;
+      }
+      /* if (ray.info.d < volume_dist)
+       {
+         float4 fog = (ray.info.d / (100.f * volume_dist)) * ray.throughput *
+       (1.f - exp2(-pow(ray.info.d / (1.f * volume_dist), volume_power)));
+         ray.output += fog;
+         // ray.throughput*=mix((float4)(0.95f),(float4)(1.f),fog);
+       }*/
+      /*
+      if (ray.info.object.type == 1 && ray.info.d < volume_dist) {
+              float est = 1.f - pow(ray.info.d / (volume_dist * 0.25f ),
+      volume_power); float scatter_amount = (RandomFloat01(rng) > 0.995f) ?
+      est : 0.f; if (scatter_amount > 0.f) { norm = compute_norm(ray, point,
+      ray.info.d, light, fractal, ray_args, args); float cost2 =
+      RandomFloat01(rng); float3 dirr = normalize(uniform_sphere(rng));
+      ray.dir = normalize(mix(norm +dirr, ray.dir, est)); d = 0.f; ray.pos =
+      point; float thingy =
+      (smoothstep(1.f,0.f,est*est*max(0.f,min(1.f,dot(norm,dirr)))));
+      ray.output
+      +=ray.throughput * thingy; ray.throughput *= thingy; if
+      (RandomFloat01(rng) > 0.015f) { break;
+                      }
+              }
+        }*/
+      //* (1 + (((d-r_dist) * (d-r_dist)) * div))
+      if (ray.info.d < det) {
+        // d -= ray_args->epsilon;
+        // point = ray.pos + (ray.dir * d);
+        norm = normalize(compute_norm(ray_args->epsilon, ray, point, ray.info.d,
+                                      light, fractal, ray_args, args));
+        point += norm * ray_args->epsilon;
+        d = length(point - ray.pos);
+
+        hit_p = point;
+        ray.info = de(ray, point, light, fractal, ray_args, args);
+        material = ray.info.object.mat;
+
+        if (ray.info.object.type == 1) {
+          // float3 tt = normalize(ray.info.fractal_z - ray.info.fractal_c);
+          // float theta = (atan2(tt.y, tt.z) + M_PI_F) / (M_PI_F);
+
+          // float phi = (atan2(tt.y, tt.x) + M_PI_F) / (M_PI_F);
+
+          // float a1 = fmod(theta, 2.f);
+          //  a1 =
+          // float a2 = fmod(phi, 2.f);
+          // a1 = (phi + M_PI_F * 0.5f / M_PI_F);
+
+          // specular = (float4)(fabs(fmod(a1 * 1.f, 1.f)));
+          // specular = (float4)(a2);
+
+          // float2 coordd = (float2)(a2, a1) * args->sb_size;
+          // int2 coordd2 = (int2)((int)(coordd.x), (int)(coordd.y));
+          // float4 cc = rgb_to_xyz(read_imagef(skybox, sampler_const,
+          // coordd2)); specular = cc;
+          // specular = mix(0.25f, 1.f, material.specular.w * (1.f -
+          // material.roughness));
+          specular = (float4)(1.f);
+          // float v =
+          //     fabs(pow(1.0f / (ray.info.fractal_shit.y + 1.f), 0.05f) *
+          //     600.);
+          // float3 v2 =
+          //     hue_b(30.002 * pow(ray.info.fractal_shit.z, 0.125f), args);
+
+          // float r = cos(v);
+          // float b = sin(v);
+          // float g = (r + b) * 0.5f;
+          /*diffuse = rgb_to_xyz(clamp(
+              (float4)(hue_b(20.0 * pow(ray.info.fractal_shit.y, .15f), args),
+                       1.f),
+              0.f, 1.f));*/
+          // bool cond = ray.info.fractal_shit.z >0.45f;
+          diffuse =
+              rgb_to_xyz(clamp((float4)(hue_b(args->input_grid.r1[3] *
+                                                  pow(ray.info.fractal_shit.z,
+                                                      args->input_grid.r1[4]),
+                                              args),
+                                        1.f),
+                               0.f, 1.f));
+
+          // diffuse = rgb_to_xyz((float4)(1.f, 1.f, 1.f, 1.f));
+          //  specular = rgb_to_xyz(clamp((float4)(r, g, b, 1.f), 0.f, 1.f));
+          //    rgb_to_xyz(clamp((float4)(hue_b(800.002
+          //    *pow(ray.info.fractal_shit.z,0.125f), args), 1.f),0.f, 1.f))
+          //
+        } else {
+          diffuse = material.diffuse;
+          specular = material.specular;
+        }
+        norm = compute_norm(ray_args->epsilon, ray, point, ray.info.d, light,
+                            fractal, ray_args, args);
+
+        spec_chance = material.specular.w;
+        if (spec_chance > 0.f && false) {
+
+          spec_chance = compute_fresnel_reflect(1.00029f, material.ior, ray.dir,
+                                                norm, material.specular.w, 1.f);
+          ;
+        }
+        spec_amount = (RandomFloat01(rng) < spec_chance) ? 1.f : 0.f;
+        if (bounce > 1) {
+          float ray_chance = max(
+              0.001f, (spec_amount == 1.0f) ? spec_chance : 1.0f - spec_chance);
+          ray.throughput *= ray_chance;
+        }
+
+        if (material.emissive.w > 0.f) {
+          albedo = material.emissive;
+          diffuse = material.emissive;
+        } else {
+          albedo = diffuse;
+        }
+
+        ray.info.hit = true;
+
+        break;
+      }
+    }
+    float va = 1.f; /*
+ float raydi = length(hit_p - ray.pos);
+ float dist = args->input_grid.r0[3];
+  if (ray.info.hit == false) {va=1.03f;}
+ if (raydi > dist ) {
+          float4 fog =va* log2(bounce+2.f)*
+    ray.throughput * (1.f - (exp2(-(raydi - dist) * .1f)));
+ ray.output +=fog;
+ //      ray.throughput *= clamp(ray.throughput * (1.f - (exp2(-(raydi -
+ //      dist) * .1f))), 0.f,1.f);
+ ray.throughput *=clamp((1.f-fog),0.0f,1);
+ }
+     if (ray.info.hit == false) {
+
+       break;
+     }*/
+
+    /*
+float4 diffusel = albedo / M_PI_F;
+
+float lpd = ray_args->stop_distance;
+float dd = length(light->pos - hit_p);
+bool past = false;
+hit_info_t info;
+
+float ks = spec_chance;
+float kd = 1.f - ks;
+float3 light_dir_full = light->pos - hit_p;
+float l_dist = length(light_dir_full);
+float3 light_dir = normalize(light_dir_full);
+float cos_theta = fabs(dot(norm, light_dir));
+
+float4 radiance = light->mat.emissive * ao * (1.f / (l_dist * l_dist));
+
+for (int lstep = 0; lstep < shade_args->shadow_steps; lstep++)
+{
+float3 p = hit_p + (normalize(light->pos - hit_p) * lpd);
+info = de(ray, p, light, fractal, ray_args, args);
+lpd += info.d;
+if (info.d < ray_args->stop_distance)
+{
+
+    radiance *= info.object.mat.emissive;
+    // gi /= ((lpd>1.f)?(lpd):1.f);
+    break;
+}
+if (lpd > dd)
+{
+    past = true;
+    break;
+};
+}*/
+    if (ray.info.hit == false) {
+      break;
+    }
+
+    float3 specular_reflection =
+        normalize(ray.dir - (2.f * dot(ray.dir, norm) * norm));
+
+    // weight = (2.f*M_PI_F)/cost;
+    // weight = (2.f*M_PI_F)/cost;
+    // orient_to_norm(uniform_hemisphere(cost, rng), norm)
+    float3 diffuse_reflection = normalize(norm + uniform_sphere(rng));
+    specular_reflection =
+        normalize(mix(specular_reflection, diffuse_reflection,
+                      material.roughness * material.roughness));
+
+    float3 new_dir =
+        normalize(mix(diffuse_reflection, specular_reflection, spec_amount));
+    float3 wo = new_dir;
+    float3 wi = normalize(ray.pos - hit_p);
+    float cost = max(0.f, dot(wi, norm));
+    weight = (cost);
+    float3 v = normalize(wo);
+    // float3 specl = normalize(ray.dir - (2.f * dot(ray.dir, norm) * norm));
+    //  Compute radiance
+    float3 l = normalize(light->pos - hit_p);
+    float3 h = normalize(wo + l);
+    float distance = length(light->pos - hit_p) - light->options.w;
+    float attenuation = native_recip(distance * .5f);
+    float3 radiance = light->mat.emissive.xyz * attenuation;
+
+    // Trying to match the brdf https://learnopengl.com/PBR/Lighting
+    float3 n = (norm);
+
+    float f0n = material.ior - 1.0f;
+    float f0d = material.ior + 1.0f;
+    float3 f0 = ((f0n * f0n) / (f0d * f0d)) * diffuse.xyz;
+    f0 = mix(f0, albedo.xyz, material.metallic);
+
+    // Ambient Occlusion
+    float sum = 0.0f;
+    float max_sum = 0.0f;
+    // float ratio = 0.f;
+    float aod = 0.f;
+    for (int i = 0; i < shade_args->ao_steps; i++) {
+      float3 ao_p = hit_p + (n * (i + 1) * shade_args->ao_size);
+      hit_info_t info_ao = de(ray, ao_p, light, fractal, ray_args, args);
+      float p2i = native_recip(native_powr(2.f, i));
+      aod += info_ao.d;
+      sum += p2i * info_ao.d;
+      max_sum += p2i * (i + 1) * shade_args->ao_size;
+      // ratio = (float)(shade_args->ao_steps) * (float)(i + 1);
+    }
+
+    float ao = native_divide(sum, max_sum) * args->input_grid.r0[4];
+
+    // Fake GI
+
+    sum = 0.0f;
+    max_sum = 0.0f;
+    float3 gi_dir = mix(normalize(light->pos - hit_p), norm, .1f);
+    // (shade_args->fake_gi_falloff_scale * attenuation)
+    float gi_size = shade_args->fake_gi_size;
+    for (int i = 0; i < shade_args->fake_gi_steps; i++) {
+      float3 gi_p = hit_p + (gi_dir * (i + 1) * gi_size);
+      hit_info_t info_gi = de(ray, gi_p, light, fractal, ray_args, args);
+      float p2i = native_recip(native_powr(2.f, i));
+      sum += p2i * info_gi.d;
+      max_sum += p2i * (i + 1) * gi_size;
+    }
+
+    float gi = native_divide(sum, max_sum);
+
+    // Hard Shadow Calculation
+    bool past = false;
+    hit_info_t info;
+    float dd = length(light->pos - hit_p) - light->options.x;
+    float lpd = ray_args->epsilon;
+    float md = 1.f;
+    float3 lightp;
+    float maxd = 0.f;
+    float mind = 10.f;
+    // float detail_s = detail;
+    float3 ld = normalize(light->pos - hit_p);
+    for (int lstep = 0; lstep < shade_args->shadow_steps; lstep++) {
+      lightp = hit_p + (ld * lpd);
+      info = de(ray, lightp, light, fractal, ray_args, args);
+      lpd += info.d;
+
+      // float det = max(ray_args->stop_distance, gdtail(detail_s, lpd));
+      if (info.d > maxd)
+        maxd = info.d;
+      if (info.d < mind)
+        mind = info.d;
+      if (info.d < ray_args->stop_distance) {
+        /*radiance *= mix(0.1f*(diffuse.xyz*ao/native_sqrt(maxd+mind)),
+           mix(1.f,ao,1.f /
+           (1+native_sqrt(maxd+mind)))*info.object.mat.emissive.xyz+0.2f*diffuse.xyz*ao,
+                        1.f /(1 + maxd-mind));*/
+        // if(info.object.mat.emissive.w>0.f)
+        /*radiance *= mix(0.1f * (diffuse.xyz * ao),
+                        mix(1.f, ao, 1.f / (1 + native_sqrt(maxd + mind))) *
+                                info.object.mat.emissive.xyz +
+                            0.25f * diffuse.xyz * ao,
+                        (lpd / dd));*/
+        if (info.object.mat.emissive.w == 0.f)
+          radiance *= 0.f;
+        // else{radiance *=(1.f+lpd)/(1.f+dd)*.01f*ao;}
+        // radiance *=md;
+
+        // shade_args->shadow_scale
+        //*attenuation
+        //  gi /= ((lpd>1.f)?(lpd):1.f);
+        if (info.object.type == 0) {
+          // radiance *= mix(0.25f,info.object.mat.emissive.xyz, max(0.f,
+          // dot(n,l))); radiance *= ray.throughput.xyz; shadow_hit=true;
+        } else {
+          // radiance *= mix(1.f,info.object.mat.emissive.xyz,  1.f /
+          // (bounce+1));
+        }
+        break;
+      }
+      if (lpd > dd + ray_args->stop_distance) {
+        radiance = 0.f;
+        break;
+      }
+    }
+
+    // Soft shadow calculation
+    /*
+float res = 1.0f;
+float t = 0.f;
+float ph = 1e10;
+    float td = 0.f;
+for (int i = 0; i < shade_args->soft_shadow_steps; i++) {
+  info = de(ray, hit_p + normalize(light->pos - hit_p) * t, light,
+               fractal, ray_args, args);
+    float h = info.d;
+    if (info.object.type==0){h+=ray_args->ray_step;}
+
+    td+=h;
+
+    if (td> dd && i >1){
+            res *=0.f;
+            break;
+    }
+    if( h <shade_args->mind && i >2){
+            res /=i;
+            break;
+    }
+
+
+float y = h * h / (2.f * ph);
+float d = native_sqrt(h * h - y * y);
+res = min(res, 10.f * d / max(0.f, t - y));
+ph = h;
+
+t += h;
+          if (h > shade_args->maxd || t > dd)break;
+
+  res = min(res, shade_args->soft_shadow_scale * h / t);
+
+}
+res = clamp(res, 0.f, 1.0f);
+float soft_shadows = res * res * (3.f - 2.f * res);
+    */
+    // radiance *= soft_shadows;
+
+    // Cook-Torrence brdf
+    float NDF = distribution_ggx(n, h, 1 + material.roughness);
+    float G = geometry_smith(n, wi, l, material.roughness);
+    float3 F = fresnel_schlick(max(0.f, dot(wi, h)), f0);
+    // float3 F = mix(albedo.xyz,0.04f,1.f/(1+spec_chance));
+
+    // Spec/Diffuse amount
+    float3 ks = F;
+    float3 kd = ((float3)(1.f) - ks);
+    kd *= 1.f - material.metallic;
+
+    float3 num = NDF * G * F;
+    float3 den = 4.f * max(1.0f, max(dot(wi, n), 0.f) * max(dot(wo, n), 0.f));
+    float3 spec = num / den;
+    // spec_amount
+    float ndl = max(dot(n, normalize(light->pos - hit_p)), 0.f);
+    //* ndl
+    // Ao + GI mixing testing
+    float ao_out = ao;
+    float testimg = ao + ao * gi;
+    //(gi * (2.f * ao * ao)) + ao_out * gi + (0.075f * ((gi * gi + 1.f) / (2.f
+    //+
+    // ao * soft_shadows * attenuation)));
+    //* ao + ao * gi
+    //*(mix(1.f,(ao)/(1+ao),1.f))
+    //* ndl*mix(1.f,ao,.9f)//+.5f*gi*attenuation+
+    //*clamp(mix(1.f,ao*16,.9f),0.f,1.f)+.5f*clamp(ao,0.f,1.f)*attenuation
+    float3 color = clamp(kd * albedo.xyz / M_PI_F + spec, 0.f, 1) *
+                   (radiance * ndl * clamp(2.f * ao / (1.f + ao), 0.f, 1.f));
+    // color = fabs(NDF * 100.f);
+    // ray.output += material.emissive*M_PI_F*2.f*(weight/(2.f*M_PI_F));
+    /// (pbounces) + ((ao+gi*ao) * shade_args->ambient_light_scale *(mix(f0,
+    /// (float3)(1.f),shade_args->ambient_light_albedo_mix)))
+    // Blending with AO
+    float fuck = max(1.f, maxd) * attenuation;
+    //+(mix(1.f,fuck,0.75f)*ao * shade_args->ambient_light_scale *(mix(f0,
+    //(float3)(1.f), shade_args->ambient_light_albedo_mix)))
+    float4 color_out =
+        (float4)(color +
+                     (clamp(ao, 0.f, 1.f) * shade_args->ambient_light_scale *
+                      (mix(diffuse.xyz, (float3)(1.f),
+                           shade_args->ambient_light_albedo_mix))),
+                 1.f);
+    // color_out = ndl;
+    //  color_out=ao;
+    //   Ensure our physical lights come out bright
+    //(clamp(material.emissive,0.f,1.f) / (pbounces)*M_PI_F * 2.f) * weight *
+
+    // ray.output +=
+    //     ((material.emissive *weight)*M_PI_F * 2.f)  * ray.throughput;
+
+    //
+    //(color_out/(1+pbounces)) * ray.throughput
+    // ray.output += (color_out / (1 + pbounces)) * ray.throughput;
+    // ray.output +=(mix(color_out, (1.f - native_exp2(-color_out)), 0.0f))
+    // *ray.throughput;
+    // ray.output += (1.f - native_exp(-(color_out))) * ray.throughput;
+    float divv = native_recip((float)(pbounces));
+    if (material.emissive.w > 0.f) {
+      ray.output += material.emissive * divv * ray.throughput;
+      break;
+    } // native_recip(pbounces) * color_out
+    ray.output += color_out * divv * ray.throughput;
+    // ray.output += max(0.f, dot(norm, normalize(hit_p-light->pos  )));
+    //  ray.output+=ao;*ndl
+
+    // t, (1.f - native_exp2(-color_out*M_PI_F)), 0.f)
+    ray.throughput *= diffuse;
+    /*if (bounce > 5) {
+      float3 col = ray.throughput.xyz;
+      float p = max(max(col.x, col.y), col.z);
+      if (RandomFloat01(rng) > p) {
+
+        break;
+      }
+      ray.throughput *= 1.f / p;
+    }*/
+    // Failed initial impl
+    /*
+            float3 hm = fresnel_schlick(cos_theta, mix((float3)(0.04f),
+       albedo.xyz, material.metallic)) * geometry_smith(norm, ray.dir,
+       light_dir, material.roughness) * distribution_ggx(norm,
+       normalize(light_dir + ray.dir), material.roughness);
+            // ray.output += (material.emissive *
+       ray.throughput)/fabs((M_PI_F*2.f)/weight);
+            // float4 lightt = lighting;
+            float4 diffuse_calc = (kd * albedo / M_PI_F);
+            float ldn = fabs(dot(norm, light_dir));
+            float rdn = fabs(dot(norm, ray.dir));
+            float divv = (4.f * rdn * ldn);
+            float4 specular_part = (float4)(hm / divv, 1.f);
+            ray.output += ((diffuse_calc + (specular_part))) * ldn * radiance
+       * ray.throughput;
+
+            ray.throughput *= albedo;
+    */
+    // ray.throughput *= diffuse;
+    /*
+if (bounce > 3) {
+  float3 col = ray.throughput.xyz;
+  float p = max(max(col.x, col.y), col.z);
+  if (RandomFloat01(rng) > p) {
+    break;
+  }
+  ray.throughput *= 1.f / p;
+}*/
+
+    // length(light->pos - hit_p)
+    // float direct_spec = dot(light->pos - ray.pos, new_dir);
+    //  float4 lighting =
+    //      compute_lighting(light, ray, ray_args, shade_args, ray.pos, norm,
+    //                      -ray.dir, (spec_amount == 1.0f) ? 10.f : 1.f,
+    //                      args);
+
+    /*
+        float direct_spec = dot(light->pos - ray.pos, new_dir);
+
+        if (direct_spec > 0.f)
+          ray.output += direct_spec * ray.throughput;
+        */
+    // float direct_spec = dot(light->pos - ray.pos, new_dir);
+
+    ray.dir = new_dir;
+    ray.pos = hit_p;
+    // 1.f/(1.f+(length(ray.pos-point)))
+  }
+  return ray.output;
+}
+float tent(float x) {
+  float nx = clamp(x, -1.f, 1.f);
+  if (nx > 0) {
+    return 1.f - nx;
+  }
+  return nx + 1.f;
+}
+void __kernel mandelbrot(read_only image2d_t input, write_only image2d_t output,
+                         __global float *input_depth,
+                         __global float *output_depth,
+                         __read_only image2d_t skybox, args_t args,
+
+                         __global float *f2s, __global float *f1s) {
+
+  int2 coord =
+      (int2)(get_global_id(0) +
+                 (int)((args.size.x / args.split_size.x) * args.split_pos.x),
+             get_global_id(1) +
+                 (int)((args.size.y / args.split_size.y) * args.split_pos.y));
+  // output_depth[coord.x * coord.y] = 1.f;
+  float4 old_pixel = read_imagef(input, sampler_const, coord);
+
+  uint rng_state =
+      (uint)((uint)(coord.x) * (uint)(1973) + (uint)(coord.y) * (uint)(9277) +
+             (uint)(old_pixel.w) * (uint)(26699)) |
+      (uint)(1);
+  ulong s = args.offset + args.time;
+  // uint random = args.systime;
+  // random = rand_pcg(&random);
+  float4 sum = old_pixel;
+
+  float b = 1.0f / 3.0f;
+  float a = 1.0f / 3.0f;
+
+  ulong m = (ulong)(args.samples) + args.offset + args.time;
+
+  float3 origin = args.origin;
+
+  float min_distance = -1.0f;
+  float min_dist = args.input_grid.r0[0];
+  float max_dist = args.input_grid.r0[2];
+  float epsilon = args.input_grid.r0[1];
+  float steppp = 1.0f;
+  float wtfff = 1.f;
+
+  bool blending[5] = {1, 1, 1, 1, 0};
+
+  shade_args_t shade_args = (shade_args_t){
+    ao_steps : args.input_grid.r0[6],
+    ao_size : args.input_grid.r0[5],
+
+    fake_gi_steps : 8,
+    fake_gi_size : .001f,
+    fake_gi_falloff_scale : .1,
+
+    shadow_steps : 556,
+    soft_shadow_steps : 0,
+    soft_shadow_de_scale : 1.0f,
+    mind : .001f,
+    maxd : 1.,
+
+    shadow_scale : 10.f,
+    soft_shadow_scale : 10.f,
+
+    ambient_light_scale : 0.1f,
+    ambient_light_albedo_mix : 1.f,
+  };
+  float tsize = .000001f;
+  ray_args_t ray_args =
+      (ray_args_t){0.f, 0.f, 0.0f, 556, tsize, .000001f, 3.f, 1.f};
+  material_t metal = init_mat(0.15f, 0.f, 0, ((float4)(0.0f)), (float4)(1.0f),
+                              (float4)(1.0f, 1.f, 1.f, 1.f), 1.7f);
+  // 500*
+  material_t white_light = init_mat(0.0f, 0.f, 0, 100.f * (float4)(1.f),
+                                    (float4)(1.f), (float4)(1.f), 1.f);
+
+  float3 light_p = (float3)(args.input_grid.r7[0], args.input_grid.r7[1],
+                            args.input_grid.r7[2]);
+
+  object_t fractal = init_obj(1, (float3)(0.f), (float4)(1.f), metal);
+  object_t light = init_obj(0, light_p, (float4)(.05f), white_light);
+
+  hit_info_t default_hit = (hit_info_t){
+      light, false, 0.f, (float3)(0.f), (float3)(0.f), (float3)(0.f)};
+
+  while (s < m) {
+    s += 1;
+    float3 offset3 = (hammersley(s, args.target_samples, args));
+    float2 offset = offset3.yz;
+    if (args.samples < args.target_samples) {
+      offset = offset3.xy;
+    }
+    if (s == 1) {
+      offset.xy = 0.f;
+    }
+    offset.xy = (float2)(tent_dist(offset.x), tent_dist(offset.y));
+
+    float val = (tent(offset.y) * tent(offset.x));
+
+    float2 canvas = (float2)(coord.x + 0.5, coord.y + 0.5) + offset;
+    float2 ratio =
+        (float2)(1.0f / args.zoom, (args.size.s1 / args.size.s0) / args.zoom);
+    float2 px_norm =
+        ((canvas / (float2)(args.size.x, args.size.y)) - 0.5f) * ratio;
+    float r_ft = native_sqrt(dot(px_norm, px_norm));
+    float anglee = .25f;
+    float uu = (1.f - (anglee * r_ft));
+    float3 world_up = args.cam_up;
+    float3 lookat = args.lookat;
+    float3 cam_f = normalize(lookat);
+    float3 cam_r = cross(world_up, (cam_f));
+    float3 cam_u = cross((cam_f), cam_r);
+
+    // light.pos = origin - (cam_f * .1f + cam_u * .25f);
+    //      float3 c_t = v_x *
+    float3 forward = (cam_f * args.input_grid.r5[5]);
+    float3 sensor_p = (cam_r * px_norm.x + cam_u * px_norm.y + forward);
+    float hm3 = dot(normalize(sensor_p), cam_f + forward);
+    float a = RandomFloat01(&rng_state);
+    float b = RandomFloat01(&rng_state);
+    float2 offset_fd =
+        (float2)(native_sqrt(a) * args.input_grid.r5[6], 2.f * M_PI_F * b);
+    float3 ro = origin;
+    float3 rd = normalize(sensor_p);
+
+    float focal_d = length(cam_f * args.input_grid.r5[7] - origin) / hm3;
+
+    // sensor_p = (sensor_p - cam_f) + (cam_f * fd);
+    float3 fp = (ro + (rd * focal_d));
+    float3 rfo = (native_cos(offset_fd.y) * offset_fd.x) * cam_r +
+                 (native_sin(offset_fd.y) * offset_fd.x) * cam_u;
+
+    ro += rfo;
+    rd = normalize(fp - ro);
+    // ro = (sensor_p - cam_f);
+    // ro = fp-sensor_p;
+
+    // START
+    // float min_dist = 0.0000000151f;
+    /// 000001f
+
+    // ray_t ray = (ray_t){
+    // 0, normalize(rd), ro, ((float4)(1.f)), (float3)(0.f)};
+
+    ray_t ray = (ray_t){ro, rd, (float4)(0.f), (float4)(1.f), default_hit};
+    float4 color = render(coord, &rng_state, ray, &light, &fractal, &shade_args,
+                          &ray_args, &args, skybox, input_depth, output_depth);
+    color.w = 1.f;
+    color.xyz *= 1.f;
+    sum += color;
+  }
+  write_imagef(output, coord, sum);
+}
+
+void __kernel post_process(read_only image2d_t input,
+                           write_only image2d_t output) {
+
+  int2 coord = (int2)(get_global_id(0), get_global_id(1));
+
+  float4 color = read_imagef(input, sampler_const, coord);
+  color /= color.w;
+  // color = color / (1.f + color);
+  color.xyz = pow(color.xyz, 1.f / (float3)(1.4));
+  color.xyz = pow(color.xyz, (float3)(1.2));
+  color *= M_PI_F * 2;
+  // color = color / (1.f + color);
+  color = 1.f - native_exp2(-color);
+  color.xyz = mix(color.xyz, smoothstep(0.f, 1.f, color.xyz), .8f);
+  color.w = 1.f;
+
+  write_imagef(output, coord, clamp(xyz_to_rgb(color), 0.f, 1.f));
+}

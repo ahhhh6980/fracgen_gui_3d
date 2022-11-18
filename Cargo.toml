@@ -32,6 +32,6 @@ syntect = "5.0.0"
 
 [profile.release]
 opt-level = 3 # fast and small wasm
-#lto = "fat"
-#codegen-units = 1
+lto = "fat"
+codegen-units = 1
 
