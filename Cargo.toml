@@ -1,0 +1,37 @@
+[package]
+name = "FracgenGui3D"
+version = "0.0.1"
+edition = "2021"
+
+authors = ["Shelby Lynn B."]
+readme = "README.md"
+license = "AGPL"
+license-file = "LICENSE"
+
+[dependencies]
+byteorder = "1.4.3"
+chrono = "0.4.19"
+colortypes = "0.6.2"
+eframe = "0.18.0"
+enum-map = "2.4.1"
+epaint = "0.18.1"
+fastrand = "1.8.0"
+gif = "0.11.4"
+gilrs = "0.10.0"
+image = "0.24.3"
+linya = "0.3.0"
+nalgebra = "0.31.3"
+num = "0.4.0"
+num_cpus = "1.13.1"
+ocl = "0.19.3"
+png = "0.17.5"
+rand = "0.8.5"
+rayon = "1.5.3"
+rfd = "0.10.0"
+syntect = "5.0.0"
+
+[profile.release]
+opt-level = 3 # fast and small wasm
+#lto = "fat"
+#codegen-units = 1
+

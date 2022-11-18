@@ -1,0 +1,24 @@
+ui.horizontal(|ui| {
+    ui.vertical_centered_justified(|ui| {
+        let ksjdha = (ui.available_width(), 16.0);
+        ui.set_width(ui.available_width());
+        ui.set_height(16.0);
+        ui.horizontal(|ui|{
+            if ui.button("Choose Output Folder").clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.renderer.output = path.display().to_string();
+                }
+            }
+            if ui.button("Open Output Folder").clicked() {
+                // if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                //     self.renderer.output = path.display().to_string();
+                // }
+                std::process::Command::new( "explorer" )
+                    .arg(ZZZ) // <- Specify the directory you'd like to open.
+                    .spawn( )
+                    .unwrap( );
+            }
+        })
+        
+    });
+});

@@ -1,0 +1,2342 @@
+/*
+    Copyright (C) 2022  Shelby Lynn B.
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Affero General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Affero General Public License for more details.
+
+    You should have received a copy of the GNU Affero General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
+//! Show a custom window frame instead of the default OS window chrome decorations.
+#![feature(is_some_with)]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
+
+// use gui_testing::MyApp;
+
+use std::{fs::{File, self}, path::PathBuf};
+
+use colortypes::{CIELab, Color, FromColorType, Image, Rgb, Srgb, Xyz, D65};
+use eframe::{
+    egui::{
+        self, color_picker, menu, panel::Side, style::Spacing, Checkbox, Event, Frame,
+        InnerResponse, Key, Modifiers, Order, PointerButton, Response, TextEdit,
+    },
+    emath::Align,
+};
+use epaint::{color::Hsva, Color32, Pos2, Rect, Rounding, Shadow, Stroke, TextureHandle, Vec2};
+use FracgenGui3D::{rendering::*, FractalArgs, Renderer};
+use num::complex::Complex64;
+
+pub struct InputMenu {
+    pub viewport_size: (String, String, bool),
+    pub export_size: (String, String, bool),
+    pub samples: String,
+    pub width: f32,
+    pub page: usize,
+    pub bail: (String, bool),
+    pub iter_count: String,
+    pub origin: (String, String),
+    pub julia: (String, String, bool),
+    pub julia_speed: f64,
+}
+
+pub struct LastData {
+    pub origin: Complex64,
+    pub args: FractalArgs,
+}
+
+pub struct Viewport {
+    pub image_size: (usize, usize),
+    pub image: Image<Rgb, D65>,
+    pub texture: Option<TextureHandle>,
+    pub image_space: f32,
+    pub img_empty_space: (f32, f32),
+    pub renderer: Renderer,
+    pub last: LastData,
+    pub active: bool,
+    pub needs_resize: Option<(f32, f32)>,
+}
+
+#[allow(unused)]
+impl Viewport {
+    fn resize_h(&mut self, new_h: f32) {
+        self.resize((self.image_size.0 as f32, new_h));
+    }
+    fn resize_w(&mut self, new_w: f32) {
+        self.resize((new_w, self.image_size.1 as f32));
+    }
+    fn resize(&mut self, new_size: (f32, f32)) {
+        self.image_size = (new_size.0.round() as usize, new_size.1.round() as usize);
+        self.image = Image::new(self.image_size);
+        self.renderer.args.size = self.image_size;
+        self.renderer.raw = Image::new(self.image_size);
+        self.renderer.rendered_samples = 0;
+    }
+}
+
+pub struct Events {
+    // any mouse click or release
+    pub mouse_any: Option<bool>,
+    // Mouse left, right, middle clicks
+    pub m_left: Option<bool>,
+    pub m_right: Option<bool>,
+    pub m_middle: Option<bool>,
+    pub m_pos: Option<Pos2>,
+    // Enter key
+    pub enter: Option<bool>,
+    // Arrow key presses
+    pub a_right: Option<bool>,
+    pub a_left: Option<bool>,
+    pub a_up: Option<bool>,
+    pub a_down: Option<bool>,
+    // Scroll vector
+    pub scroll: Option<Vec2>,
+
+    pub q: Option<bool>,
+    pub w: Option<bool>,
+    pub a: Option<bool>,
+    pub s: Option<bool>,
+    pub z: Option<bool>,
+    pub x: Option<bool>,
+    pub e: Option<bool>,
+    pub r: Option<bool>,
+}
+
+impl Events {
+    pub fn clear(&mut self) {
+        self.m_pos = None;
+        self.mouse_any = None;
+        self.m_left = None;
+        self.m_right = None;
+        self.m_middle = None;
+        self.enter = None;
+        self.a_right = None;
+        self.a_left = None;
+        self.a_up = None;
+        self.a_down = None;
+        self.scroll = None;
+        self.q = None;
+        self.w = None;
+        self.a = None;
+        self.s = None;
+        self.z = None;
+        self.x = None;
+        self.e = None;
+        self.r = None;
+    }
+}
+
+// #[derive(Default)]
+pub struct FracgenGUI {
+    pub abs_scroll: f64,
+    pub viewport: Viewport,
+    pub input_menu: InputMenu,
+    pub pointer: Option<Pos2>,
+    pub node_menu_height: f32,
+    pub renderer: Renderer,
+    pub events: Events,
+    pub temp_julia: Option<Complex64>,
+    pub viewport_interact: bool,
+}
+impl Default for FracgenGUI {
+    #[inline]
+    fn default() -> FracgenGUI {
+        let df_vp_size = (256,256);
+        let df_op_size = (512,512);
+        println!("SIZE OF ARGS; {}", std::mem::size_of::<FractalArgs>());
+        println!("SIZE OF ARGS; {}", std::mem::size_of::<RenderData>());
+        let o = FractalArgs::new((0,0)).origin;
+        // let args = FractalArgs::new();
+        FracgenGUI {
+            abs_scroll: 0.0,
+            viewport_interact: false,
+            temp_julia: None,
+            events: Events {
+                m_pos: None,
+                mouse_any: None,
+                m_left: None,
+                m_right: None,
+                m_middle: None,
+                enter: None,
+                a_right: None,
+                a_left: None,
+                a_up: None,
+                a_down: None,
+                scroll: None,
+                q: None,
+                w: None,
+                a: None,
+                s: None,
+                z: None,
+                x: None,
+                e: None,
+                r: None,
+            },
+            renderer: Renderer::new(
+                df_op_size,
+                FractalArgs::new(df_op_size),
+                (num_cpus::get() as f64).ceil() as usize - 2,
+                true,
+                false,
+            ),
+            viewport: Viewport {
+                active: true,
+                image_size: df_vp_size,
+                image: Image::new(df_vp_size),
+                texture: None,
+                image_space: 0.0,
+                img_empty_space: (0.0, 0.0),
+                last: LastData {
+                    origin: o,
+                    args: FractalArgs::new(df_vp_size),
+                },
+                renderer: Renderer::new(
+                    df_vp_size,
+                    FractalArgs::new(df_vp_size),
+                    (num_cpus::get() as f64).ceil() as usize - 2,
+                    false,
+                    true,
+                ),
+                needs_resize: None,
+            },
+            input_menu: {
+                let def_args = FractalArgs::new((0,0));
+                InputMenu {
+                    julia_speed: 0.01,
+                    viewport_size: (df_vp_size.0.to_string(), df_vp_size.1.to_string(), true),
+                    export_size: (df_op_size.0.to_string(), df_op_size.1.to_string(), true),
+                    samples: 64.to_string(),
+                    width: 128.0,
+                    page: 0,
+                    bail: (def_args.bail.to_string(), false),
+                    iter_count: def_args.limit.to_string(),
+                    origin: (o.re.to_string(), o.im.to_string()),
+                    julia: (0.to_string(), 0.to_string(), false),
+                }
+            },
+            pointer: None,
+            node_menu_height: 128.0,
+        }
+    }
+}
+
+fn image_to_colorimage(image: &Image<Rgb, D65>) -> epaint::ColorImage {
+    epaint::ColorImage {
+        size: [image.width(), image.height()],
+        pixels: image
+            .pixels()
+            .map(|x| {
+                let nx = x.to_arr8().0;
+                epaint::color::Color32::from_rgb(nx[0], nx[1], nx[2])
+            })
+            .collect::<Vec<_>>(),
+    }
+}
+
+fn process_key_standard_mode(
+    p: bool,
+    up: bool,
+    ctrl_code: bool,
+    render_arg: &mut f64,
+    correlate: &mut Option<bool>,
+    scalar_mult: f64,
+    fix: Option<fn(&mut f64) -> f64>,
+) {
+    if up {
+        if ctrl_code {
+            *render_arg += 1.0 * scalar_mult;
+        } else {
+            *render_arg *= 1.05 * scalar_mult;
+        }
+    } else if ctrl_code {
+        *render_arg -= 1.0 * scalar_mult;
+    } else {
+        *render_arg /= 1.05 * scalar_mult;
+    }
+    if let Some(fix_funct) = fix {
+        (fix_funct)(render_arg);
+    }
+    println!("{}", *render_arg);
+    *correlate = Some(p)
+}
+
+/*
+match key {
+                                        Key::Num1 => {
+                                            self.viewport.renderer.args.color_funct_choice = 1;
+                                            self.viewport.renderer.args.color_funct = stripe;
+                                        }
+                                        Key::Num2 => {
+                                            self.viewport.renderer.args.color_funct_choice = 2;
+                                            self.viewport.renderer.args.color_funct = image_mapping;
+                                        }
+                                        Key::Num3 => {
+                                            self.viewport.renderer.args.color_funct_choice = 3;
+                                            self.viewport.renderer.args.color_funct = fade_original;
+                                        }
+                                        Key::Num4 => {
+                                            self.viewport.renderer.args.color_funct_choice = 4;
+                                            self.viewport.renderer.args.color_funct = paper_cut;
+                                        }
+                                        Key::Num5 => {
+                                            self.viewport.renderer.args.color_funct_choice = 5;
+                                            self.viewport.renderer.args.color_funct = testingf;
+                                        }
+                                        Key::Num6 => {
+                                            self.viewport.renderer.args.color_funct_choice = 6;
+                                            self.viewport.renderer.args.color_funct = trap_avg;
+                                        }
+                                        Key::Num7 => {
+                                            self.viewport.renderer.args.color_funct_choice = 7;
+                                            self.viewport.renderer.args.color_funct = normal_map;
+                                        }
+                                        Key::Num8 => {
+                                            self.viewport.renderer.args.color_funct_choice = 8;
+                                            self.viewport.renderer.args.color_funct = foral;
+                                        }
+                                        // Reserved
+                                        Key::Num9 => {
+                                            self.viewport.renderer.args.color_funct_page += 1;
+                                            if self.viewport.renderer.args.color_funct_page > 3 {
+                                                self.viewport.renderer.args.color_funct_page -= 1
+                                            }
+                                        }
+                                        Key::Num0 => {
+                                            self.viewport.renderer.args.color_funct_page -= 1;
+                                            if self.viewport.renderer.args.color_funct_page > 3 {
+                                                self.viewport.renderer.args.color_funct_page = 0
+                                            }
+                                        }
+                                        _ => (),
+                                    }
+*/
+
+pub fn process_color_key(
+    key: Key,
+    choice: &mut usize,
+    page: &mut usize,
+    change: &mut fn(&Renderer, RenderData) -> Color<CIELab, D65>,
+    f: Vec<(&str, fn(&Renderer, RenderData) -> Color<CIELab, D65>)>,
+) {
+    match key {
+        Key::Num1 => {
+            *choice = 1 + (8 * *page);
+            let chosen = f[(*choice - 1) % f.len()];
+            *change = chosen.1;
+            println!("PICKED {}:{}", chosen.0, *choice);
+        }
+        Key::Num2 => {
+            *choice = 2 + (8 * *page);
+            let chosen = f[(*choice - 1) % f.len()];
+            *change = chosen.1;
+            println!("PICKED {}:{}", chosen.0, *choice);
+        }
+        Key::Num3 => {
+            *choice = 3 + (8 * *page);
+            let chosen = f[(*choice - 1) % f.len()];
+            *change = chosen.1;
+            println!("PICKED {}:{}", chosen.0, *choice);
+        }
+        Key::Num4 => {
+            *choice = 4 + (8 * *page);
+            let chosen = f[(*choice - 1) % f.len()];
+            *change = chosen.1;
+            println!("PICKED {}:{}", chosen.0, *choice);
+        }
+        Key::Num5 => {
+            *choice = 5 + (8 * *page);
+            let chosen = f[(*choice - 1) % f.len()];
+            *change = chosen.1;
+            println!("PICKED {}:{}", chosen.0, *choice);
+        }
+        Key::Num6 => {
+            *choice = 6 + (8 * *page);
+            let chosen = f[(*choice - 1) % f.len()];
+            *change = chosen.1;
+            println!("PICKED {}:{}", chosen.0, *choice);
+        }
+        Key::Num7 => {
+            *choice = 7 + (8 * *page);
+            let chosen = f[(*choice - 1) % f.len()];
+            *change = chosen.1;
+            println!("PICKED {}:{}", chosen.0, *choice);
+        }
+        Key::Num8 => {
+            *choice = 8 + (8 * *page);
+            let chosen = f[(*choice - 1) % f.len()];
+            *change = chosen.1;
+            println!("PICKED {}:{}", chosen.0, *choice);
+        }
+        // Reserved
+        Key::Num9 => {
+            *page += 1;
+            if *page > 3 {
+                *page -= 1
+            }
+        }
+        Key::Num0 => {
+            *page -= 1;
+            if *page > 3 {
+                *page = 0
+            }
+        }
+        _ => (),
+    }
+}
+
+#[allow(unused)]
+impl eframe::App for FracgenGUI {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let mut color_interact = false;
+        self.events.clear();
+        let input = ctx.input().clone();
+        let files = input.raw.dropped_files;
+        if !files.is_empty() {
+            self.viewport.renderer.args.image_map_textures.clear();
+            let count = files.len();
+            let paths = files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect::<Vec<Option<PathBuf>>>();
+            paths.iter().for_each(|p| {
+                if let Some(path) = p {
+                    let ext = path.extension();
+                    if let Some(ftype) = ext {
+                        match ftype.to_str() {
+                            Some("gif") => {
+                                self.viewport.renderer.args.gif_map = true;
+                                // Gif input
+                                let mut decoder = gif::DecodeOptions::new();
+                                decoder.set_color_output(gif::ColorOutput::RGBA);
+                                // Decode gif
+                                let mut gif = decoder.read_info(File::open(path).unwrap()).unwrap();
+                                // Move all frames into media
+                                let mut i = 0;
+                                while let Some(f) = gif.read_next_frame().unwrap() {
+                                    let (w, h) = (f.width, f.height);
+                                    self.viewport.renderer.args.image_map_textures.push({
+                                        let size = (f.width as usize, f.height as usize);
+                                        let mut out: Image<Xyz, D65> = Image::new(size);
+                                        for (a, b) in out.pixels_mut().zip(f.buffer.chunks_exact(4))
+                                        {
+                                            *a = Xyz::from_color(Rgb::new([
+                                                b[0] as f64 / 255.0,
+                                                b[1] as f64 / 255.0,
+                                                b[2] as f64 / 255.0,
+                                                b[3] as f64 / 255.0,
+                                            ]))
+                                        }
+                                        out
+                                    });
+                                    i += 1;
+                                }
+                                println!(
+                                    "\nFRAMES: {}\n",
+                                    self.viewport.renderer.args.image_map_textures.len()
+                                );
+                                println!(
+                                    "\n{},{} over {}\n",
+                                    self.viewport.renderer.args.image_map_textures[0].width(),
+                                    self.viewport.renderer.args.image_map_textures[0].height(),
+                                    self.viewport.renderer.args.image_map_textures.len()
+                                );
+                            }
+                            Some("png") | Some("jpg") | Some("jpeg") => {
+                                self.viewport.renderer.args.gif_map = false;
+                                println!("{}", path.to_str().unwrap_or("error"));
+                                self.viewport.renderer.args.image_map_textures.push({
+                                    let a = image::open(path).unwrap().to_rgba32f();
+                                    let size = (a.width() as usize, a.height() as usize);
+                                    let mut out: Image<Xyz, D65> = Image::new(size);
+                                    for (a, b) in out.pixels_mut().zip(a.pixels()) {
+                                        let arr = b.0;
+                                        *a = Xyz::from_color(Rgb::new([
+                                            arr[0] as f64,
+                                            arr[1] as f64,
+                                            arr[2] as f64,
+                                            arr[3] as f64,
+                                        ]))
+                                    }
+                                    out
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+        }
+
+        // let key_presses = input.keys_down;
+        // input.pointer
+        let mouse_input = input.pointer;
+        // let a = input.
+        let mut scalar_mult = 1.0;
+        let mut axis_bool = false;
+        let mut alt_code = false;
+        let mut ctrl_code = false;
+        let egui::Modifiers {
+            alt: a,
+            ctrl: c,
+            shift: s,
+            mac_cmd: m,
+            command: c2,
+        } = input.modifiers;
+        {
+            if s {
+                scalar_mult = 1.25;
+            }
+            axis_bool = s;
+            alt_code = a;
+            ctrl_code = c;
+        }
+        let mut pressed = false;
+
+        if !self.viewport.renderer.rendering && self.viewport_interact {
+            for event in input.events {
+                match event {
+                    Event::Key {
+                        key,
+                        pressed: p,
+                        modifiers,
+                    } => {
+                        if key != Key::Space {
+                            if key != Key::Enter {
+                                pressed = p;
+                            }
+                        } else if !self.viewport.renderer.rendering {
+                            self.viewport.renderer.render(false, 8, false)
+                        }
+                        match modifiers {
+                            // This is for iteration functions
+                            Modifiers {
+                                alt: false,
+                                ctrl: false,
+                                shift: false,
+                                mac_cmd: false,
+                                command: false,
+                            } => match key {
+                                Key::Num1 => {
+                                    self.viewport.renderer.args.iter_funct_choice = 1;
+                                    self.viewport.renderer.args.iter_funct = fractal_mandelbrot;
+                                }
+                                Key::Num2 => {
+                                    self.viewport.renderer.args.iter_funct_choice = 2;
+                                    self.viewport.renderer.args.iter_funct = fractal_burning_ship;
+                                }
+                                Key::Num3 => {
+                                    self.viewport.renderer.args.iter_funct_choice = 3;
+                                    self.viewport.renderer.args.iter_funct = fractal_hybrid_lober;
+                                }
+                                Key::Num4 => {
+                                    self.viewport.renderer.args.iter_funct_choice = 4;
+                                    self.viewport.renderer.args.iter_funct = fractal_testing;
+                                }
+                                // Key::Num5 => {
+                                //     self.viewport.renderer.args.iter_funct_choice = Some(5);
+                                //     self.viewport.renderer.args.iter_funct = fractal_mandelbrot;
+                                // }
+                                // Key::Num6 => {
+                                //     self.viewport.renderer.args.iter_funct_choice = Some(6);
+                                //     self.viewport.renderer.args.iter_funct = fractal_mandelbrot;
+                                // }
+                                // Key::Num7 => {
+                                //     self.viewport.renderer.args.iter_funct_choice = Some(7);
+                                //     self.viewport.renderer.args.iter_funct = fractal_mandelbrot;
+                                // }
+                                // Key::Num8 => {
+                                //     self.viewport.renderer.args.iter_funct_choice = Some(8);
+                                //     self.viewport.renderer.args.iter_funct = fractal_mandelbrot;
+                                // }
+                                // Reserved
+                                // Key::Num9 => (),
+                                // Key::Num0 => (),
+                                _ => (),
+                            },
+                            // This is for coloring functions
+                            Modifiers {
+                                alt: true,
+                                ctrl: false,
+                                shift: false,
+                                mac_cmd: false,
+                                command: false,
+                            } => process_color_key(
+                                key,
+                                &mut self.viewport.renderer.args.color_funct_choice,
+                                &mut self.viewport.renderer.args.color_funct_page,
+                                &mut self.viewport.renderer.args.color_funct,
+                                vec![
+                                    ("VHS_SMOOTH", VHS_SMOOTH),
+                                    ("image_mapping", image_mapping),
+                                    ("stripe", stripe),
+                                    ("RAINBOW_SMOOTH", RAINBOW_SMOOTH),
+                                    ("VHS_DISCRETE", VHS_DISCRETE),
+                                    ("trap_avg", trap_avg),
+                                    ("RAINBOW_DISCRETE", RAINBOW_DISCRETE),
+                                    ("floral", floral)],
+                            )
+                            ,
+
+                            // This is for conditional functions
+                            Modifiers {
+                                alt: false,
+                                ctrl: false,
+                                shift: true,
+                                mac_cmd: false,
+                                command: false,
+                            } => match key {
+                                Key::Num1 => (),
+                                Key::Num2 => (),
+                                Key::Num3 => (),
+                                Key::Num4 => (),
+                                Key::Num5 => (),
+                                Key::Num6 => (),
+                                Key::Num7 => (),
+                                Key::Num8 => (),
+                                // Reserved
+                                Key::Num9 => (),
+                                Key::Num0 => (),
+                                _ => (),
+                            },
+                            _ => {}
+                        }
+                        if p {
+                            match key {
+                                Key::F =>
+                                {
+                                    #[allow(clippy::collapsible_if)]
+                                    if pressed {
+                                        if !self.viewport.renderer.init_rendering {
+                                            if self.viewport.renderer.recording {
+                                                println!("STARTED RECORDING");
+                                                self.viewport.renderer.recording = false;
+                                            } else {
+                                                println!(
+                                                    "STOPPED RECORDING @ {} FRAMES",
+                                                    self.viewport.renderer.recorded_frames
+                                                );
+                                                self.viewport.renderer.init_rendering = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                Key::J => {
+                                    self.viewport.renderer.args.julia.1 =
+                                        !self.viewport.renderer.args.julia.1;
+                                }
+                                Key::Enter => {
+                                    if self.events.enter.is_none() {
+                                        self.events.enter = Some(p)
+                                    }
+                                }
+                                Key::Q => {
+                                    if self.events.q.is_none() {
+                                        process_key_standard_mode(
+                                            pressed,
+                                            false,
+                                            ctrl_code,
+                                            &mut self.viewport.renderer.args.h,
+                                            &mut self.events.q,
+                                            scalar_mult,
+                                            None,
+                                        );
+                                    }
+                                }
+                                Key::W => {
+                                    if self.events.w.is_none() {
+                                        process_key_standard_mode(
+                                            pressed,
+                                            true,
+                                            ctrl_code,
+                                            &mut self.viewport.renderer.args.h,
+                                            &mut self.events.w,
+                                            scalar_mult,
+                                            None,
+                                        );
+                                    }
+                                }
+
+                                Key::A => {
+                                    if self.events.a.is_none() {
+                                        process_key_standard_mode(
+                                            pressed,
+                                            false,
+                                            ctrl_code,
+                                            &mut self.viewport.renderer.args.h2,
+                                            &mut self.events.a,
+                                            scalar_mult,
+                                            None,
+                                        );
+                                    }
+                                }
+                                Key::S => {
+                                    if self.events.s.is_none() {
+                                        process_key_standard_mode(
+                                            pressed,
+                                            true,
+                                            ctrl_code,
+                                            &mut self.viewport.renderer.args.h2,
+                                            &mut self.events.s,
+                                            scalar_mult,
+                                            None,
+                                        );
+                                    }
+                                }
+
+                                Key::Z => {
+                                    if self.events.z.is_none() {
+                                        process_key_standard_mode(
+                                            pressed,
+                                            false,
+                                            ctrl_code,
+                                            &mut self.viewport.renderer.args.cexp,
+                                            &mut self.events.z,
+                                            scalar_mult,
+                                            None,
+                                        );
+                                    }
+                                }
+                                Key::X => {
+                                    if self.events.x.is_none() {
+                                        process_key_standard_mode(
+                                            pressed,
+                                            true,
+                                            ctrl_code,
+                                            &mut self.viewport.renderer.args.cexp,
+                                            &mut self.events.x,
+                                            scalar_mult,
+                                            None,
+                                        );
+                                    }
+                                }
+                                Key::E => {
+                                    if self.events.z.is_none() {
+                                        process_key_standard_mode(
+                                            pressed,
+                                            false,
+                                            ctrl_code,
+                                            &mut self.viewport.renderer.args.cexp2,
+                                            &mut self.events.e,
+                                            scalar_mult,
+                                            None,
+                                        );
+                                    }
+                                }
+                                Key::R => {
+                                    if self.events.x.is_none() {
+                                        process_key_standard_mode(
+                                            pressed,
+                                            true,
+                                            ctrl_code,
+                                            &mut self.viewport.renderer.args.cexp2,
+                                            &mut self.events.r,
+                                            scalar_mult,
+                                            None,
+                                        );
+                                    }
+                                }
+                                Key::ArrowLeft => {
+                                    if self.events.a_left.is_none() {
+                                        if ctrl_code {
+                                            self.viewport.renderer.args.limit /= 1.05 * scalar_mult;
+                                        } else {
+                                            self.viewport.renderer.args.limit -= 1.0 * scalar_mult;
+                                        }
+                                        if self.viewport.renderer.args.limit < 0.0 {
+                                            self.viewport.renderer.args.limit = 1.0;
+                                        }
+                                        self.events.a_left = Some(p)
+                                    }
+                                }
+                                Key::ArrowRight => {
+                                    if self.events.a_right.is_none() {
+                                        if ctrl_code {
+                                            self.viewport.renderer.args.limit *= 1.05 * scalar_mult;
+                                        } else {
+                                            self.viewport.renderer.args.limit += 1.0 * scalar_mult;
+                                        }
+                                        self.events.a_right = Some(p)
+                                    }
+                                }
+                                Key::ArrowUp => {
+                                    if self.events.a_up.is_none() {
+                                        self.viewport.renderer.args.bail *= 1.05 * scalar_mult;
+                                        self.events.a_down = Some(p)
+                                    }
+                                }
+                                Key::ArrowDown => {
+                                    if self.events.a_down.is_none() {
+                                        self.viewport.renderer.args.bail /= 1.05 * scalar_mult;
+                                        self.events.a_up = Some(p)
+                                    }
+                                }
+                                Key::P => {
+                                    if p {
+                                        self.viewport.active = !self.viewport.active;
+                                    }
+                                }
+                                _ => (),
+                            }
+                        }
+                    }
+                    Event::Scroll(v) => {
+                        pressed = true;
+                        self.events.scroll = Some(v)
+                    }
+                    Event::PointerButton {
+                        pos,
+                        button,
+                        pressed: p,
+                        modifiers,
+                    } => {
+                        pressed = p;
+                        self.events.m_pos = Some(pos);
+                        match button {
+                            PointerButton::Primary => self.events.m_left = Some(p),
+                            PointerButton::Secondary => self.events.m_right = Some(p),
+                            PointerButton::Middle => self.events.m_middle = Some(p),
+                        }
+                    }
+                    _ => (),
+                }
+            }
+        }
+        if self.viewport.active {
+            if let Some(size) = self.viewport.needs_resize {
+                self.viewport.resize(size);
+                self.viewport.renderer.clear();
+                self.viewport.renderer.render(false, 1, false);
+                self.viewport.needs_resize = None;
+            }
+        }
+        let ratio = self.viewport.renderer.args.size.0 as f64 / self.viewport.renderer.args.size.1 as f64;
+        let title_bar_height = 32.0;
+        custom_window_frame(title_bar_height, ctx, frame, "FracgenGUI", |ui| {
+            let mut frame_size = ui.available_size();
+            frame_size.y -= title_bar_height;
+            let mut rect = ui.max_rect();
+            // rect.set_width(rect.width() - 128.0);
+            let painter = ui.painter();
+            // Paint the frame:
+            painter.rect(rect, 0.0, Color32::from_rgb(0, 0, 0), Stroke::none());
+            egui::Area::new("Window")
+                .fixed_pos((0.0, title_bar_height))
+                .movable(false)
+                .show(ctx, |ui| {
+                    egui::SidePanel::new(Side::Right, "OptionsPanel")
+                        .resizable(true)
+                        .width_range(frame_size.x / 6.0..=frame_size.x - (frame_size.x / 6.0))
+                        .frame(
+                            Frame::none()
+                                .fill(Color32::from_rgb(24, 24, 24))
+                                .outer_margin(0.0)
+                                .rounding(Rounding {
+                                    nw: 0.0,
+                                    ne: 0.0,
+                                    sw: 0.0,
+                                    se: 0.0,
+                                }),
+                        )
+                        .show_inside(ui, |ui| {
+                            // egui::ScrollArea::new([false, true]).show_rows(ui, 32.0, 8, |ui, row_range| {
+                            //     for row in row_range {
+
+                            //     }
+                            // });
+                            let www = ui.available_width();
+                            egui::ScrollArea::new([true, true])
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    // ui.men
+                                    // menu::bar()
+                                    let visuals = ui.visuals_mut();
+                                    visuals.button_frame = false;
+                                    // visuals.selection.bg_fill =
+                                    //     Color32::from_rgba_unmultiplied(255, 255, 255, 255);
+                                    visuals.selection.stroke.color =
+                                        Color32::from_rgba_unmultiplied(255, 255, 255, 255);
+                                    visuals.selection.stroke.width = 1.0;
+                                    // visuals.widgets.style(response)
+                                    menu::bar(ui, |ui| {
+                                        let visuals = ui.visuals_mut();
+                                        ui.set_height(24.0);
+                                        let mut rect = ui.max_rect();
+                                        // rect.set_width(rect.width() - 128.0);
+                                        let painter = ui.painter();
+                                        // Paint the frame:
+                                        painter.rect(
+                                            rect,
+                                            0.0,
+                                            Color32::from_rgb(32, 32, 32),
+                                            Stroke::none(),
+                                        );
+                                        ui.add_space(6.0);
+                                        let style = ui.style_mut();
+                                        // style.visuals.window_fill()
+                                        // ui.add_sized(
+                                        //     256.0,
+                                        //     menu::
+                                        //     menu::menu_button(&mut ui, "Viewport", |ui| {}),
+                                        // );
+                                        // let mut fill = ui.visuals_mut().widgets.open.bg_fill;
+                                        ui.visuals_mut().button_frame = true;
+                                        // ui.visuals_mut().
+                                        let mut fill = ui.visuals_mut().widgets.hovered.bg_fill =
+                                            Color32::from_rgba_unmultiplied(16, 16, 16, 255);
+                                        // fill = Color32::from_rgba_unmultiplied(0, 0, 0, 255);
+                                        let mut fill = ui.visuals_mut().widgets.inactive.bg_fill =
+                                            Color32::from_rgba_unmultiplied(24, 24, 24, 255);
+                                        // fill = Color32::from_rgba_unmultiplied(0, 0, 0, 255);
+
+                                        // fill = Color32::from_rgba_unmultiplied(0, 0, 0, 255);
+
+                                        ui.menu_button("Viewtitleport", |ui| {
+                                            ui.set_height(0.0);
+                                            ui.set_width(0.0);
+                                            self.input_menu.page = 0;
+                                            ui.close_menu()
+                                        });
+                                        ui.menu_button("Coloring", |ui| {
+                                            ui.set_height(0.0);
+                                            ui.set_width(0.0);
+                                            self.input_menu.page = 1;
+                                            ui.close_menu()
+
+                                            // ui.set_height(0.0);
+                                            // ui.set_width(0.0);
+                                            // ui.menu_button("title", add_contents)
+                                            // self.input_menu.page = 1;
+                                            // ui.close_menu()
+                                        });
+                                        ui.menu_button("Iteration", |ui| {
+                                            ui.set_height(0.0);
+                                            ui.set_width(0.0);
+                                            self.input_menu.page = 2;
+                                            ui.close_menu()
+                                            // ui.set_height(0.0);
+                                            // ui.set_width(0.0);
+                                            // ui.menu_button("title", add_contents)
+                                            // self.input_menu.page = 1;
+                                            // ui.close_menu()
+                                        });
+
+                                        ui.menu_button("ABS", |ui| {
+                                            ui.set_height(0.0);
+                                            ui.set_width(0.0);
+                                            self.input_menu.page = 3;
+                                            ui.close_menu()
+                                            // ui.set_height(0.0);
+                                            // ui.set_width(0.0);
+                                            // ui.menu_button("title", add_contents)
+                                            // self.input_menu.page = 1;
+                                            // ui.close_menu()
+                                        });
+
+                                        // .response;
+                                        // if vp_page.clicked() {
+                                        //     self.input_menu.page = 0
+                                        // }
+                                    });
+                                    /// ASS
+                                    match self.input_menu.page {
+                                        // Render settings
+                                        0 => {
+                                            let mut a = ui.spacing_mut();
+                                            // a = Spacing::default();
+                                            a.item_spacing.y = 0.0;
+                                            ui.set_width(www);
+                                            let mut size = ui.available_size();
+                                            let mut bsize = ui.available_size();
+                                            size.y = 16.0;
+                                            bsize.y = 16.0;
+                                            bsize.x -= 46.0;
+                                            // bsize.x /= 2.0;
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                ui.label("Viewport Dimensions/Keep Ratio: ");
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                let width_response = ui.add_sized(
+                                                    (bsize.x / 2.0, 16.0),
+                                                    TextEdit::singleline(
+                                                        &mut self.input_menu.viewport_size.0,
+                                                    )
+                                                    .hint_text("Viewport Width"),
+                                                );
+                                                let height_response = ui.add_sized(
+                                                    (bsize.x / 2.0, 16.0),
+                                                    TextEdit::singleline(
+                                                        &mut self.input_menu.viewport_size.1,
+                                                    )
+                                                    .hint_text("Viewport Height"),
+                                                );
+                                                ui.add_sized(
+                                                    (16.0, 16.0),
+                                                    Checkbox::new(
+                                                        &mut self.input_menu.viewport_size.2,
+                                                        "",
+                                                    ),
+                                                );
+                                                if width_response.lost_focus()
+                                                    && ui.input().key_pressed(egui::Key::Enter)
+                                                {
+                                                    if let Ok(new_w) = self
+                                                        .input_menu
+                                                        .viewport_size
+                                                        .0
+                                                        .parse::<f32>()
+                                                    {
+                                                        let mut new_h = if let Some((_, new_h)) =
+                                                            self.viewport.needs_resize
+                                                        {
+                                                            new_h
+                                                        } else {
+                                                            self.viewport.image_size.1 as f32
+                                                        };
+                                                        if self.input_menu.viewport_size.2 {
+                                                            new_h = new_h * (new_w as f32 / new_h);
+                                                            self.input_menu.viewport_size.1 =
+                                                                (new_h.round() as usize)
+                                                                    .to_string();
+                                                        }
+                                                        self.viewport.needs_resize =
+                                                            Some((new_w, new_h));
+                                                    } else {
+                                                        self.input_menu.viewport_size.0 =
+                                                            if let Some((new_w, _)) =
+                                                                self.viewport.needs_resize
+                                                            {
+                                                                new_w.to_string()
+                                                            } else {
+                                                                self.viewport
+                                                                    .image_size
+                                                                    .0
+                                                                    .to_string()
+                                                            };
+                                                    }
+                                                }
+
+                                                if height_response.lost_focus()
+                                                    && ui.input().key_pressed(egui::Key::Enter)
+                                                {
+                                                    if let Ok(new_h) = self
+                                                        .input_menu
+                                                        .viewport_size
+                                                        .1
+                                                        .parse::<f32>()
+                                                    {
+                                                        let mut new_w = if let Some((new_w, _)) =
+                                                            self.viewport.needs_resize
+                                                        {
+                                                            new_w
+                                                        } else {
+                                                            self.viewport.image_size.0 as f32
+                                                        };
+                                                        if self.input_menu.viewport_size.2 {
+                                                            new_w = new_w * (new_h as f32 / new_w);
+                                                            self.input_menu.viewport_size.0 =
+                                                                (new_w.round() as usize)
+                                                                    .to_string();
+                                                        }
+                                                        self.viewport.needs_resize =
+                                                            Some((new_w, new_h));
+                                                    } else {
+                                                        self.input_menu.viewport_size.1 =
+                                                            if let Some((new_w, _)) =
+                                                                self.viewport.needs_resize
+                                                            {
+                                                                new_w.to_string()
+                                                            } else {
+                                                                self.viewport
+                                                                    .image_size
+                                                                    .1
+                                                                    .to_string()
+                                                            };
+                                                    }
+                                                }
+                                            });
+                                            
+                                            ui.add_space(4.0);
+                                            ui.separator();
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                ui.label("Export Dimensions/Keep Ratio: ");
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                let export_width_response = ui.add_sized(
+                                                    (bsize.x / 2.0, 16.0),
+                                                    TextEdit::singleline(
+                                                        &mut self.input_menu.export_size.0,
+                                                    )
+                                                    .hint_text("Export Width"),
+                                                );
+                                                let export_height_response = ui.add_sized(
+                                                    (bsize.x / 2.0, 16.0),
+                                                    TextEdit::singleline(
+                                                        &mut self.input_menu.export_size.1,
+                                                    )
+                                                    .hint_text("Export Height"),
+                                                );
+                                                ui.add_sized(
+                                                    (16.0, 16.0),
+                                                    Checkbox::new(
+                                                        &mut self.input_menu.export_size.2,
+                                                        "",
+                                                    ),
+                                                );
+
+                                                if export_width_response.lost_focus()
+                                                    && ui.input().key_pressed(egui::Key::Enter)
+                                                {
+                                                    if let Ok(new_w) =
+                                                        self.input_menu.export_size.0.parse::<f32>()
+                                                    {
+                                                        let mut new_h = self.renderer.args.size.1 as f32;
+                                                        if self.input_menu.export_size.2 {
+                                                            let ratio =
+                                                                new_w / self.renderer.args.size.0 as f32;
+                                                            new_h *= ratio;
+                                                            self.input_menu.export_size.1 =
+                                                                (new_h.round() as usize)
+                                                                    .to_string();
+                                                        }
+                                                        self.renderer.args.size = (
+                                                            new_w.round() as usize,
+                                                            new_h.round() as usize,
+                                                        );
+                                                        self.renderer.raw =
+                                                            Image::new(self.renderer.args.size);
+                                                        self.input_menu.export_size.0 =
+                                                            (new_w.round() as usize).to_string();
+                                                    } else {
+                                                        self.input_menu.export_size.0 =
+                                                            self.renderer.args.size.0.to_string();
+                                                    }
+                                                }
+
+                                                if export_height_response.lost_focus()
+                                                    && ui.input().key_pressed(egui::Key::Enter)
+                                                {
+                                                    if let Ok(new_h) =
+                                                        self.input_menu.export_size.1.parse::<f32>()
+                                                    {
+                                                        let mut new_w = self.renderer.args.size.0 as f32;
+                                                        if self.input_menu.export_size.2 {
+                                                            let ratio =
+                                                                new_h / self.renderer.args.size.1 as f32;
+                                                            new_w *= ratio;
+                                                            self.input_menu.export_size.0 =
+                                                                (new_w.round() as usize)
+                                                                    .to_string();
+                                                        }
+                                                        self.renderer.args.size = (
+                                                            new_w.round() as usize,
+                                                            new_h.round() as usize,
+                                                        );
+                                                        self.renderer.raw =
+                                                            Image::new(self.renderer.args.size);
+                                                        self.input_menu.export_size.1 =
+                                                            (new_h.round() as usize).to_string();
+                                                    } else {
+                                                        self.input_menu.export_size.1 =
+                                                            self.renderer.args.size.1.to_string();
+                                                    }
+                                                }
+                                            });
+                                            ui.add_space(4.0);
+                                            ui.horizontal(|ui| {
+                                                ui.vertical_centered_justified(|ui| {
+                                                    let ksjdha = (ui.available_width(), 16.0);
+                                                    ui.set_width(ui.available_width());
+                                                    ui.set_height(16.0);
+                                                    ui.horizontal(|ui|{
+                                                        if ui.button("Choose Output Folder").clicked() {
+                                                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                                                self.renderer.output = path.display().to_string();
+                                                            }
+                                                        }
+                                                        if ui.button("Open Output Folder").clicked() {
+                                                            // if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                                            //     self.renderer.output = path.display().to_string();
+                                                            // }
+                                                            if let Ok(p) = fs::canonicalize(PathBuf::from(&self.renderer.output)) {
+                                                                print!("{:?}", p);
+                                                                std::process::Command::new( "nautilus" )
+                                                                .arg(p) // <- Specify the directory you'd like to open.
+                                                                .spawn( )
+                                                                .unwrap( );
+                                                            }
+                                                            
+                                                        }
+                                                    })
+                                                    
+                                                });
+                                            });
+                                            ui.add_space(4.0);
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                let fuck = ui.available_width() / 2.0 - 56.0;
+                                                ui.vertical(|ui| {
+                                                    let ksjdha = (fuck, 16.0);
+                                                    ui.add_sized(ksjdha, egui::TextEdit::singleline(&mut self.renderer.output).hint_text("File path"))
+                                                });
+                                                ui.vertical(|ui| {
+                                                    let ksjdha = (fuck, 16.0);
+                                                    ui.add_sized(ksjdha, egui::TextEdit::singleline(&mut self.renderer.output_name.0).hint_text("File name"))
+                                                });
+                                                ui.vertical(|ui| {
+                                                    let ksjdha = ( 64.0, 16.0);
+                                                    ui.add_sized(ksjdha, egui::Checkbox::new(&mut self.renderer.output_name.1, "Named?"));
+                                                });
+
+                                            });
+                                            ui.add_space(2.0);
+                                            ui.separator();
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                ui.label("Viewport/Export Samples: ");
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                let w = ui.available_width();
+                                                ui.add_sized(
+                                                    (bsize.x / 2.0, 16.0),
+                                                    TextEdit::singleline(
+                                                        &mut self
+                                                            .viewport
+                                                            .renderer
+                                                            .rendered_samples
+                                                            .to_string(),
+                                                    )
+                                                    .hint_text("Viewport Samples")
+                                                    .interactive(false),
+                                                );
+                                                let samples_response = ui.add_sized(
+                                                    (bsize.x / 2.0, 16.0),
+                                                    TextEdit::singleline(
+                                                        &mut self.input_menu.samples,
+                                                    )
+                                                    .hint_text("Export Samples"),
+                                                );
+                                            });
+                                            ui.add_space(4.0);
+                                            ui.separator();
+                                            ()
+                                        }
+                                        // Coloring
+                                        1 => {
+                                            ui.vertical(|ui| {
+                                                // let mut responses = Vec::new();
+                                                ui.vertical(|ui| {
+                                                    let result = ui.add(
+                                                        egui::Slider::new(
+                                                            &mut self.viewport.renderer.args.hue_offset_pre_exp,
+                                                            0.0..=360.0,
+                                                        )
+                                                        .logarithmic(true)
+                                                        .text("Hue Shift PreExp"),
+                                                    );
+                                                    if result.changed() {
+                                                        pressed = true;
+                                                    }
+            
+                                                    let result = ui.add(
+                                                        egui::Slider::new(
+                                                            &mut self
+                                                                .viewport
+                                                                .renderer
+                                                                .args
+                                                                .hue_offset_post_exp,
+                                                            0.0..=360.0,
+                                                        )
+                                                        .text("Hue Shift PostExp"),
+                                                    );
+                                                    if result.changed() {
+                                                        pressed = true;
+                                                    }
+            
+                                                    let result = ui.add(
+                                                        egui::Slider::new(
+                                                            &mut self.viewport.renderer.args.hue_scale,
+                                                            0.1..=10.0,
+                                                        )
+                                                        .text("Hue Scale"),
+                                                    );
+                                                    if result.changed() {
+                                                        pressed = true;
+                                                    }
+            
+                                                    let result = ui.add(
+                                                        egui::Slider::new(
+                                                            &mut self.viewport.renderer.args.hue_exponent,
+                                                            1.0..=2.0,
+                                                        )
+                                                        .logarithmic(true)
+                                                        .text("Hue Exp"),
+                                                    );
+                                                    if result.changed() {
+                                                        pressed = true;
+                                                    }
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    let response = ui.add(
+                                                        egui::DragValue::new(
+                                                            &mut self
+                                                                .viewport
+                                                                .renderer
+                                                                .args
+                                                                .test_mat
+                                                                .r1
+                                                                .x,
+                                                        )
+                                                        .speed(0.025),
+                                                    );
+                                                    if response.changed() {
+                                                        pressed = true;
+                                                    }
+                                                    // pressed |= response.changed();
+                                                    let response = ui.add(
+                                                        egui::DragValue::new(
+                                                            &mut self
+                                                                .viewport
+                                                                .renderer
+                                                                .args
+                                                                .test_mat
+                                                                .r1
+                                                                .y,
+                                                        )
+                                                        .speed(0.025),
+                                                    );
+                                                    pressed |= response.changed();
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    let response = ui.add(
+                                                        egui::DragValue::new(
+                                                            &mut self
+                                                                .viewport
+                                                                .renderer
+                                                                .args
+                                                                .test_mat
+                                                                .r2
+                                                                .x,
+                                                        )
+                                                        .speed(0.025),
+                                                    );
+                                                    pressed |= response.changed();
+                                                    let response = ui.add(
+                                                        egui::DragValue::new(
+                                                            &mut self
+                                                                .viewport
+                                                                .renderer
+                                                                .args
+                                                                .test_mat
+                                                                .r2
+                                                                .y,
+                                                        )
+                                                        .speed(0.025),
+                                                    );
+                                                    pressed |= response.changed();
+                                                });
+                                            });
+                                        }
+                                        // Iteration Stuff
+                                        2 => {
+                                            let mut a = ui.spacing_mut();
+                                            // a = Spacing::default();
+                                            a.item_spacing.y = 0.0;
+                                            ui.set_width(www);
+                                            let mut size = ui.available_size();
+                                            let mut bsize = ui.available_size();
+                                            size.y = 16.0;
+                                            bsize.y = 16.0;
+                                            bsize.x -= 46.0;
+                                            // bsize.x /= 2.0;
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                ui.label("Bounds: ");
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                let response = ui.add(
+                                                    egui::Slider::new(
+                                                        &mut self.viewport.renderer.args.bail,
+                                                        1.0..=(2 << 24) as f64,
+                                                    )
+                                                    .logarithmic(true)
+                                                    .prefix("Bailout: "),
+                                                );
+                                                pressed |= response.changed();
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                let response = ui.add(
+                                                    egui::Slider::new(
+                                                        &mut self.viewport.renderer.args.limit,
+                                                        1.0..=(2 << 16) as f64,
+                                                    )
+                                                    .logarithmic(true)
+                                                    .prefix("Limit: "),
+                                                );
+                                                pressed |= response.changed();
+                                            });
+                                            ui.add_space(8.0);
+                                            ui.separator();
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                ui.label("Change: ");
+                                                let response = ui.add(
+                                                    egui::Slider::new(
+                                                        &mut self.input_menu.julia_speed,
+                                                        0.0001..=2.0,
+                                                    )
+                                                    .logarithmic(true),
+                                                );
+                                                pressed |= response.changed();
+                                            });
+                                            ui.add_space(8.0);
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                ui.label("Julia Re: ");
+                                                let response = ui.add(
+                                                    egui::DragValue::new(
+                                                        &mut self.viewport.renderer.args.julia.0.re,
+                                                    )
+                                                    .speed(self.input_menu.julia_speed),
+                                                );
+
+                                                pressed |= response.changed();
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                ui.label("Julia Im: ");
+                                                let response = ui.add(
+                                                    egui::DragValue::new(
+                                                        &mut self.viewport.renderer.args.julia.0.im,
+                                                    )
+                                                    .speed(self.input_menu.julia_speed),
+                                                );
+                                                pressed |= response.changed();
+                                            });
+
+                                            ui.add_space(4.0);
+
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                ui.label("Init Z Re: ");
+                                                let response = ui.add(
+                                                    egui::DragValue::new(
+                                                        &mut self.viewport.renderer.args.z_init.re,
+                                                    )
+                                                    .speed(self.input_menu.julia_speed),
+                                                );
+
+                                                pressed |= response.changed();
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(8.0);
+                                                ui.label("Init Z Im: ");
+                                                let response = ui.add(
+                                                    egui::DragValue::new(
+                                                        &mut self.viewport.renderer.args.z_init.im,
+                                                    )
+                                                    .speed(self.input_menu.julia_speed),
+                                                );
+                                                pressed |= response.changed();
+                                            });
+                                            ui.add_space(4.0);
+                                            // egui::ScrollArea::new(has_bar)
+
+                                            ui.separator();
+                                            ()
+                                        }
+                                        // Abs folding stuff
+                                        3 => {
+                                            // let mut scroll_delta = input.scroll_delta;
+                                            // // let response = ui.allocate_response(desired_size, sense)
+                                            // // if
+                                            // self.abs_scroll += scroll_delta.y as f64;
+                                            // // if ui.button("Scroll down").clicked() {
+                                            // //     scroll_delta.y -= 0.05;
+                                            // // }
+                                            // // if ui.button("Scroll up").clicked() {
+                                            // //     scroll_delta.y += 0.05;
+                                            // // }
+                                            egui::ScrollArea::vertical().show_rows(
+                                                ui,
+                                                64.0 + 9.0 + (16.0 * 3.0),
+                                                self.viewport.renderer.args.z_steps,
+                                                |ui, rows| {
+                                                    // ui.scroll_with_delta(Vec2 {
+                                                    //     x: 0.0,
+                                                    //     y: self.abs_scroll as f32,
+                                                    // });
+                                                    // ui.scroll_with_delta(scroll_delta);
+                                                    let fuck = rows.len();
+                                                    let mut rows = rows;
+                                                    // ui.scroll_to_cursor(Some(Align::BOTTOM));
+                                                    ui.vertical(|ui| {
+                                                ui.set_height(16.0);
+                                                ui.horizontal(|ui| {
+                                                    let mut rect = ui.available_rect_before_wrap();
+                                                    
+                                                    let painter = ui.painter();
+                                                    // Paint the frame:
+                                                    painter.rect(rect, 0.0, Color32::from_rgb(16, 16, 16), Stroke::none());
+                                                    
+                                                    if ui.button("Add").clicked() {
+                                                        self.viewport
+                                                            .renderer
+                                                            .args
+                                                            .z_offsets
+                                                            .push( LinearTransform::default());
+    
+                                                        self.viewport.renderer.args.z_steps += 1;
+                                                        rows = 0..self.viewport.renderer.args.z_steps
+                                                    }
+                                                    if ui.button("Delete").clicked()
+                                                    && self.viewport.renderer.args.z_steps > 1
+                                                {
+                                                    self.viewport.renderer.args.z_offsets.pop();
+                                                    self.viewport.renderer.args.z_steps -= 1;
+                                                    rows = 0..self.viewport.renderer.args.z_steps
+                                                }
+                                                
+                                                });
+                                                    });
+                                                    
+                                                
+                                                    for mut row in rows {
+                                                        let mut changed = false;
+
+                                                        ui.vertical(|ui| {
+                                                            // let deleted = 
+                                                            ui.horizontal(|ui| {
+                                                                ui.add_space(8.0);
+                                                                ui.set_height(16.0);
+                                                                 let mut rect = ui.available_rect_before_wrap();
+                                                                //  rect.min.x += 4.0;
+                                                                rect.max.x -= 8.0;
+                                                                 rect.max.y += 4.0;
+                                                                let painter = ui.painter();
+                                                                // Paint the frame:
+                                                                painter.rect(rect, 0.0, Color32::from_rgb(12, 12, 12), Stroke::none());
+                                                                // ui.scroll_to_cursor(Some(Align::BOTTOM));
+                                                                if row > 0 {
+                                                                    
+                                                                 if ui.button("Move Up").clicked()
+                                                                    && self.viewport.renderer.args.z_steps > 1
+                                                                    {
+                                                                    self.viewport.renderer.args.z_offsets.swap(row, row-1);
+                                                                    changed = true;
+                                                                    pressed = true;
+                                                                    }
+                                                                } else {
+                                                                    ui.add_space(64.0);
+
+                                                                }
+                                                                if row < fuck - 1 && ui.button("Move Down").clicked() {
+                                                                    self.viewport
+                                                                        .renderer
+                                                                        .args
+                                                                        .z_offsets
+                                                                        .swap(row, row+1);
+
+                                                                    changed = true;
+                                                                    pressed = true;
+                                                                } 
+                                                            });
+                                                            if !changed {
+ // ui.set_max_height(64.0);
+                                                            // ui.set_height(64.0);
+                                                            // ui.horizontal(|ui|)
+                                                            // egui::M
+                                                            ui.push_id(
+                                                                format!("Row {} Collapse", row),
+                                                                |ui| {
+                                                                ui.add_space(4.0);
+
+                                                                    ui.horizontal(|ui| {
+                                                                ui.add_space(8.0);
+
+                                                                        ui.add_sized(
+                                                                            (16.0, 16.0),
+                                                                            egui::Checkbox::new(
+                                                                                &mut self
+                                                                                    .viewport
+                                                                                    .renderer
+                                                                                    .args
+                                                                                    .z_offsets[row]
+                                                                                    .apply_inv,
+                                                                                "Apply Inverse?",
+                                                                            ),
+                                                                        );
+                                                                        ui.collapsing(
+                                                                            match self
+                                                                                .viewport
+                                                                                .renderer
+                                                                                .args
+                                                                                .z_offsets[row]
+                                                                                .mode
+                                                                            {
+                                                                                LinearTransformMode::Offset => "Offset",
+                                                                                LinearTransformMode::Rotate => "Rotate",
+                                                                                LinearTransformMode::Scale => "Scale",
+                                                                                LinearTransformMode::Transform => "Transform",
+                                                                                LinearTransformMode::Mobius => "Mobius",
+                                                                                LinearTransformMode::Power => "Power",
+                                                                            },
+                                                                            |ui| {
+                                                                                // ui.id
+                                                                                ui.set_max_height(
+                                                                                    16.0 * 3.0,
+                                                                                );
+                                                                                if ui
+                                                                                    .button(
+                                                                                        "Offset",
+                                                                                    )
+                                                                                    .clicked()
+                                                                                {
+                                                                                    self.viewport
+                                                                                    .renderer
+                                                                                    .args
+                                                                                    .z_offsets[row]
+                                                                                    .mode = LinearTransformMode::Offset;
+                                                                                }
+                                                                                if ui
+                                                                                    .button(
+                                                                                        "Rotate",
+                                                                                    )
+                                                                                    .clicked()
+                                                                                {
+                                                                                    self.viewport
+                                                                                    .renderer
+                                                                                    .args
+                                                                                    .z_offsets[row]
+                                                                                    .mode = LinearTransformMode::Rotate;
+                                                                                }
+                                                                                if ui
+                                                                                    .button("Scale")
+                                                                                    .clicked()
+                                                                                {
+                                                                                    self.viewport
+                                                                                    .renderer
+                                                                                    .args
+                                                                                    .z_offsets[row]
+                                                                                    .mode = LinearTransformMode::Scale;
+                                                                                }
+                                                                                if ui
+                                                                                    .button(
+                                                                                        "Transform",
+                                                                                    )
+                                                                                    .clicked()
+                                                                                {
+                                                                                    self.viewport
+                                                                                    .renderer
+                                                                                    .args
+                                                                                    .z_offsets[row]
+                                                                                    .mode = LinearTransformMode::Transform;
+                                                                                }
+                                                                                if ui
+                                                                                    .button(
+                                                                                        "Mobius",
+                                                                                    )
+                                                                                    .clicked()
+                                                                                {
+                                                                                    self.viewport
+                                                                                    .renderer
+                                                                                    .args
+                                                                                    .z_offsets[row]
+                                                                                    .mode = LinearTransformMode::Mobius;
+                                                                                }
+                                                                                if ui
+                                                                                    .button(
+                                                                                        "Power",
+                                                                                    )
+                                                                                    .clicked()
+                                                                                {
+                                                                                    self.viewport
+                                                                                    .renderer
+                                                                                    .args
+                                                                                    .z_offsets[row]
+                                                                                    .mode = LinearTransformMode::Power;
+                                                                                }
+                                                                            },
+                                                                        );
+                                                                    });
+                                                                },
+                                                            );
+                                                            ui.horizontal(|ui| {
+                                                                ui.set_height(16.0);
+                                                                ui.add_space(8.0);
+                                                                match self
+                                                                    .viewport
+                                                                    .renderer
+                                                                    .args
+                                                                    .z_offsets[row]
+                                                                    .mode
+                                                                {
+                                                                    LinearTransformMode::Offset => {
+                                                                        let wx = (ui
+                                                                            .available_width()
+                                                                            / 2.0)
+                                                                            - 80.0;
+                                                                        ui.add_sized(
+                                                                            (16.0, 16.0),
+                                                                            egui::Checkbox::new(
+                                                                                &mut self
+                                                                                    .viewport
+                                                                                    .renderer
+                                                                                    .args
+                                                                                    .z_offsets[row]
+                                                                                    .active,
+                                                                                "",
+                                                                            ),
+                                                                        );
+                                                                        let b = self
+                                                                            .viewport
+                                                                            .renderer
+                                                                            .args
+                                                                            .z_offsets[row]
+                                                                            .abs;
+                                                                        let response = ui
+                                                                            .add_sized(
+                                                                            (wx, 16.0),
+                                                                            egui::DragValue::new(
+                                                                                &mut self
+                                                                                    .viewport
+                                                                                    .renderer
+                                                                                    .args
+                                                                                    .z_offsets[row]
+                                                                                    .offset
+                                                                                    .re,
+                                                                            )
+                                                                            .speed(
+                                                                                self.input_menu
+                                                                                    .julia_speed,
+                                                                            )
+                                                                            .prefix(if b[0] {
+                                                                                format!(
+                                                                                    "|Re({})|: ",
+                                                                                    row
+                                                                                )
+                                                                            } else {
+                                                                                format!(
+                                                                                    "Re({}): ",
+                                                                                    row
+                                                                                )
+                                                                            }),
+                                                                        );
+                                                                        pressed |=
+                                                                            response.changed();
+                                                                        ui.add_sized(
+                                                                            (16.0, 16.0),
+                                                                            egui::Checkbox::new(
+                                                                                &mut self
+                                                                                    .viewport
+                                                                                    .renderer
+                                                                                    .args
+                                                                                    .z_offsets[row]
+                                                                                    .abs[0],
+                                                                                "",
+                                                                            ),
+                                                                        );
+                                                                        let response = ui
+                                                                            .add_sized(
+                                                                            (wx, 16.0),
+                                                                            egui::DragValue::new(
+                                                                                &mut self
+                                                                                    .viewport
+                                                                                    .renderer
+                                                                                    .args
+                                                                                    .z_offsets[row]
+                                                                                    .offset
+                                                                                    .im,
+                                                                            )
+                                                                            .speed(
+                                                                                self.input_menu
+                                                                                    .julia_speed,
+                                                                            )
+                                                                            .prefix(if b[1] {
+                                                                                format!(
+                                                                                    "|Im({})|: ",
+                                                                                    row
+                                                                                )
+                                                                            } else {
+                                                                                format!(
+                                                                                    "Im({}): ",
+                                                                                    row
+                                                                                )
+                                                                            }),
+                                                                        );
+                                                                        pressed |=
+                                                                            response.changed();
+                                                                        ui.add_sized(
+                                                                            (16.0, 16.0),
+                                                                            egui::Checkbox::new(
+                                                                                &mut self
+                                                                                    .viewport
+                                                                                    .renderer
+                                                                                    .args
+                                                                                    .z_offsets[row]
+                                                                                    .abs[1],
+                                                                                "",
+                                                                            ),
+                                                                        );
+                                                                    }
+                                                                    LinearTransformMode::Scale => {
+                                                                        let offset = &mut self
+                                                                            .viewport
+                                                                            .renderer
+                                                                            .args
+                                                                            .z_offsets[row];
+                                                                        ui.vertical(|ui| {
+                                                                            ui.horizontal(
+                                                                                |ui| {
+                                                                                    let response =
+                                                                                    ui.add(
+                                                                                        egui::Checkbox::new(
+                                                                                            &mut offset.active, ""
+                                                                                        )
+                                                                                    );
+                                                                                    pressed |= response.changed();
+                                                                                    let response =
+                                                                                    ui.add(
+                                                                                        egui::Checkbox::new(
+                                                                                            &mut offset.abs[0], ""
+                                                                                        )
+                                                                                    );
+                                                                                    pressed |= response.changed();
+                                                                                    let response =
+                                                                                    ui.add(
+                                                                                        egui::Checkbox::new(
+                                                                                            &mut offset.abs[1], ""
+                                                                                        )
+                                                                                    );
+                                                                                    pressed |= response.changed();
+                                                                                }
+                                                                            );
+                                                                            let response = ui.add(
+                                                                                egui::DragValue::new(
+                                                                                    &mut offset.scalar_or_angle
+                                                                                ).speed(
+                                                                                    self.input_menu.julia_speed
+                                                                                )
+                                                                            );
+                                                                            pressed |= response.changed();
+                                                                        });
+                                                                    },
+                                                                    LinearTransformMode::Rotate => 
+                                                                    {
+                                                                        let offset = &mut self
+                                                                        .viewport
+                                                                        .renderer
+                                                                        .args
+                                                                        .z_offsets[row];
+                                                                    ui.vertical(|ui| {
+                                                                        ui.horizontal(
+                                                                            |ui| {
+                                                                                let response =
+                                                                                ui.add(
+                                                                                    egui::Checkbox::new(
+                                                                                        &mut offset.active, ""
+                                                                                    )
+                                                                                );
+                                                                                pressed |= response.changed();
+                                                                                let response =
+                                                                                ui.add(
+                                                                                    egui::Checkbox::new(
+                                                                                        &mut offset.abs[0], ""
+                                                                                    )
+                                                                                );
+                                                                                pressed |= response.changed();
+                                                                                let response =
+                                                                                ui.add(
+                                                                                    egui::Checkbox::new(
+                                                                                        &mut offset.abs[1], ""
+                                                                                    )
+                                                                                );
+                                                                                pressed |= response.changed();
+                                                                            }
+                                                                        );
+                                                                        let response = ui.add(
+                                                                            egui::DragValue::new(
+                                                                                &mut offset.scalar_or_angle
+                                                                            ).speed(
+                                                                                self.input_menu.julia_speed
+                                                                            )
+                                                                        );
+                                                                        pressed |= response.changed();
+                                                                    });
+                                                                    },
+                                                                    LinearTransformMode::Transform => {
+                                                                        let offset = &mut self
+                                                                            .viewport
+                                                                            .renderer
+                                                                            .args
+                                                                            .z_offsets[row];
+                                                                        ui.vertical(|ui| {
+                                                                            let mut angle = false;
+                                                                            let mut scale = false;
+                                                                            ui.horizontal(
+                                                                                |ui| {
+                                                                                    let response =
+                                                                                    ui.add(
+                                                                                        egui::Checkbox::new(
+                                                                                            &mut offset.active, ""
+                                                                                        )
+                                                                                    );
+                                                                                    pressed |= response.changed();
+                                                                                    let response =
+                                                                                    ui.add(
+                                                                                        egui::Checkbox::new(
+                                                                                            &mut offset.abs[0], ""
+                                                                                        )
+                                                                                    );
+                                                                                    pressed |= response.changed();
+                                                                                    let response =
+                                                                                    ui.add(
+                                                                                        egui::Checkbox::new(
+                                                                                            &mut offset.abs[1], ""
+                                                                                        )
+                                                                                    );
+                                                                                    pressed |= response.changed();
+                                                                                }
+                                                                            );
+                                                                            ui.horizontal(|ui| {
+                                                                                // let response = ui.drag_angle(&mut offset.angles[1]);
+                                                                                // if response.changed()  {
+                                                                                //     // offset.angles[0] = offset.matrix.r2.x.atan2(offset.matrix.r1.x) as f32;
+                                                                                //     offset.matrix.r1.x = offset.angles[0].cos() as f64;
+                                                                                //     offset.matrix.r2.x = -offset.angles[0].sin() as f64;
+                                                                                //     pressed = true;
+                                                                                //     angle = true;
+                                                                                // }
+                                                                                ui.add_space(16.0);
+                                                                                let response =
+                                                                                    ui.add(
+                                                                                        egui::DragValue::new(
+                                                                                            &mut offset.matrix.r1.x
+                                                                                        ).speed(
+                                                                                            self.input_menu.julia_speed
+                                                                                        )
+                                                                                    );
+                                                                                pressed |= response.changed();
+
+                                                                                // if response.changed() && !angle {
+                                                                                //     offset.angles[0] = offset.matrix.r2.x.atan2(offset.matrix.r1.x) as f32;
+                                                                                //     pressed = true;
+                                                                                //     scale = true;
+                                                                                // }
+                                                                                let response =
+                                                                                    ui.add(
+                                                                                        egui::DragValue::new(
+                                                                                            &mut offset.matrix.r1.y
+                                                                                        ).speed(
+                                                                                            self.input_menu.julia_speed
+                                                                                        )
+                                                                                    );
+                                                                                pressed |= response.changed();
+
+                                                                                // if response.changed() && !angle {
+                                                                                //     offset.angles[1] = offset.matrix.r2.y.atan2(offset.matrix.r1.y) as f32;
+                                                                                //     pressed = true;
+                                                                                //     scale = true;
+                                                                                // }
+                                                                            });
+                                                                            ui.horizontal(|ui| {
+                                                                                // let response = ui.drag_angle(&mut offset.angles[0]);
+                                                                                // if response.changed() {
+                                                                                    // offset.angles[0] = offset.matrix.r2.x.atan2(offset.matrix.r1.x) as f32;
+                                                                                    // let m = off/set.matrix.r2.y.hypot(offset.matrix.r1.y);
+                                                                                    // offset.matrix.r1.y = offset.angles[1].cos() as f64;
+                                                                                    // offset.matrix.r2.y = offset.angles[1].sin() as f64;
+                                                                                    // pressed = true;
+                                                                                // }
+                                                                                ui.add_space(16.0);
+                                                                                let response =
+                                                                                    ui.add(
+                                                                                        egui::DragValue::new(
+                                                                                            &mut offset.matrix.r2.x
+                                                                                        ).speed(
+                                                                                            self.input_menu.julia_speed
+                                                                                        )
+                                                                                    );
+                                                                                pressed |= response.changed();
+                                                                                // if response.changed() && !angle {
+                                                                                //     offset.angles[0] = offset.matrix.r2.x.atan2(offset.matrix.r1.x) as f32;
+                                                                                //     pressed = true;
+                                                                                // }
+                                                                                let response =
+                                                                                    ui.add(
+                                                                                        egui::DragValue::new(
+                                                                                            &mut offset.matrix.r2.y
+                                                                                        ).speed(
+                                                                                            self.input_menu.julia_speed
+                                                                                        )
+                                                                                    );
+                                                                                pressed |= response.changed();
+
+                                                                                // if response.changed() && !angle {
+                                                                                //     offset.angles[1] = offset.matrix.r2.x.atan2(offset.matrix.r1.x) as f32;
+                                                                                //     pressed = true;
+                                                                                // }
+                                                                            });
+                                                                            ui.add_space(4.0);
+                                                                            ui.horizontal(|ui| {
+                                                                                let response =
+                                                                                    ui.add(
+                                                                                        egui::DragValue::new(
+                                                                                            &mut offset.offset.re
+                                                                                        ).prefix("Offset: ").speed(
+                                                                                            self.input_menu.julia_speed
+                                                                                        )
+                                                                                    );
+                                                                                pressed |= response.changed();
+                                                                                let response =
+                                                                                    ui.add(
+                                                                                        egui::DragValue::new(
+                                                                                            &mut offset.offset.im
+                                                                                        ).speed(
+                                                                                            self.input_menu.julia_speed
+                                                                                        )
+                                                                                    );
+                                                                                pressed |= response.changed();
+                                                                            });
+                                                                        });
+                                                                    }
+                                                                    LinearTransformMode::Mobius => {
+                                                                        let transform = &mut self
+                                                                            .viewport
+                                                                            .renderer
+                                                                            .args
+                                                                            .z_offsets[row];
+                                                                        ui.vertical(|ui| {
+                                                                            let mut angle = false;
+                                                                            let mut scale = false;
+                                                                            ui.horizontal(
+                                                                                |ui| {
+                                                                                    let response =
+                                                                                    ui.add(
+                                                                                        egui::Checkbox::new(
+                                                                                            &mut transform.active, ""
+                                                                                        )
+                                                                                    );
+                                                                                    pressed |= response.changed();
+                                                                                    let response =
+                                                                                    ui.add(
+                                                                                        egui::Checkbox::new(
+                                                                                            &mut transform.abs[0], ""
+                                                                                        )
+                                                                                    );
+                                                                                    pressed |= response.changed();
+                                                                                    let response =
+                                                                                    ui.add(
+                                                                                        egui::Checkbox::new(
+                                                                                            &mut transform.abs[1], ""
+                                                                                        )
+                                                                                    );
+                                                                                    pressed |= response.changed();
+                                                                                }
+                                                                            );
+                                                                            ui.vertical(|ui| {
+                                                                                ui.horizontal(|ui| {
+                                                                                    let w = ui.available_width() / 4.0;
+                                                                                    ui.add_sized((w,16.0), egui::DragValue::new(&mut transform.mobius[0].re));
+                                                                                    ui.add_sized((w,16.0), egui::DragValue::new(&mut transform.mobius[0].im));
+
+                                                                                });
+                                                                                ui.horizontal(|ui| {
+                                                                                    let w = ui.available_width() / 4.0;
+                                                                                });
+                                                                                
+                                                                            })
+                                                                            
+                                                                        });
+                                                                    }
+                                                                }
+                                                            });
+                                                            }
+                                                           
+                                                        });
+                                                        ui.separator();
+                                                    }
+
+                                                    
+                                                },
+                                            );
+                                            ()
+                                        }
+                                        // etc
+                                        _ => (),
+                                    }
+                                });
+                        });
+                    ui.spacing_mut().window_margin = eframe::egui::style::Margin {
+                        left: 0.0,
+                        right: 0.0,
+                        top: 0.0,
+                        bottom: 0.0,
+                    };
+                    let size = ui.available_size();
+                    let mut rect = ui.max_rect();
+                    let rect = Rect {
+                        min: (0.0, title_bar_height).into(),
+                        max: (size.x - 4.0, size.y + title_bar_height).into(),
+                    };
+                    // rect.set_width(rect.width() - 128.0);
+                    let painter = ui.painter();
+                    // Paint the frame:
+                    painter.rect(rect, 0.0, Color32::from_rgb(16, 16, 16), Stroke::none());
+
+                    // ui.ctx().options().
+                    // Get available size
+                    let mut area = ui.available_size();
+                    area.x -= 4.0;
+                    // Get our scalars
+                    let scale_x = area.y / self.viewport.renderer.args.size.1 as f32;
+                    let scale_y = area.x / self.viewport.renderer.args.size.0 as f32;
+                    // Get our scaled viewport dimensions
+                    let scaled_x = (self.viewport.renderer.args.size.0 as f32 * scale_x);
+                    let scaled_y = (self.viewport.renderer.args.size.1 as f32 * scale_y);
+                    // Compute if it will fit within the x or y axis dependant on which side to scale up to
+                    let diff_x = area.x - scaled_x;
+                    let diff_y = area.y - scaled_y;
+                    // Use the above information to figure out some stuff
+                    let (viewport_pos, vp_new, scale) = if diff_x > diff_y {
+                        (
+                            (diff_x / 2.0, 0.0),
+                            (scaled_x, self.viewport.renderer.args.size.1 as f32 * scale_x),
+                            scale_x,
+                        )
+                    } else {
+                        (
+                            (0.0, diff_y / 2.0),
+                            (self.viewport.renderer.args.size.0 as f32 * scale_y, scaled_y),
+                            scale_y,
+                        )
+                    };
+                    let offset = (viewport_pos.0, viewport_pos.1 + title_bar_height);
+                    egui::Area::new("viewport")
+                        .fixed_pos(offset)
+                        .order(Order::Foreground)
+                        .movable(false)
+                        .show(ctx, |ui| {
+                            ui.set_width(vp_new.0);
+                            ui.set_height(vp_new.1);
+                            let painter = ui.painter();
+                            let rect = ui.max_rect();
+                            painter.rect(rect, 0.0, Color32::from_rgb(0, 0, 0), Stroke::none());
+
+                            self.viewport.texture = None;
+                            let texture: &egui::TextureHandle =
+                                self.viewport.texture.get_or_insert_with(|| {
+                                    ctx.load_texture(
+                                        "my-image",
+                                        image_to_colorimage(
+                                            &self.viewport.renderer.process_image(),
+                                        ),
+                                    )
+                                });
+
+                            // self.viewport.renderer.render(false, 1);
+                            // let (w, h) = vp_new;
+                            // texture.
+                            let (vw, vh) = self.viewport.renderer.args.size;
+                            let image = ui.image(texture, vp_new);
+                            let image_ctx = &image.ctx;
+                            if let Some(pointer) = image.hover_pos() {
+                                self.viewport_interact = true;
+                                let icoord = (
+                                    (pointer.x - (offset.0 + 1.0)) / scale,
+                                    (pointer.y - (offset.1 + 1.0)) / scale,
+                                );
+                                let (vw, vh) = self.viewport.renderer.args.size;
+                                let ratio = vh as f32 / vw as f32;
+                                let ccoord = (icoord.0 / vw as f32, (icoord.1 / vh as f32) * ratio);
+
+                                if let Some(v) = self.events.scroll {
+                                    let mut q = v.y;
+                                    if axis_bool {
+                                        q = v.x;
+                                    }
+                                    if q.signum() < 0.0 {
+                                        self.viewport.renderer.args.zoom /= 1.1 * scalar_mult;
+                                    } else {
+                                        self.viewport.renderer.args.zoom *= 1.1 * scalar_mult;
+                                    }
+                                }
+
+                                if mouse_input.primary_down() {
+                                    ///mouse
+                                    self.viewport.renderer.clear();
+                                    let mut m: egui::Vec2 = egui::Vec2::new(0.0, 0.0);
+                                    if let Some(o) = mouse_input.press_origin() {
+                                        let ipxpos_o = Pos2::new(
+                                            (o.x - (offset.0 + 1.0)) / scale,
+                                            (o.y - (offset.1 + 1.0)) / scale,
+                                        );
+                                        m = Pos2::new(icoord.0, icoord.1) - ipxpos_o;
+                                        m = egui::Vec2::new(m.x, m.y);
+                                    }
+                                    m.x = m.x / self.viewport.renderer.args.size.0 as f32;
+                                    m.y = m.y / self.viewport.renderer.args.size.1 as f32;
+
+                                    self.viewport.renderer.args.origin = self.viewport.last.origin
+                                        - (Complex64::new(m.x as f64, (m.y as f64 * ratio as f64))
+                                            / self.viewport.renderer.args.zoom);
+                                    pressed = true;
+                                }
+                                if mouse_input.secondary_down() {
+                                    if self.temp_julia.is_none() {
+                                        let mx = (icoord.0) as f64
+                                            / self.viewport.renderer.args.size.0 as f64
+                                            - 0.5;
+                                        let my = (icoord.1) as f64
+                                            / self.viewport.renderer.args.size.1 as f64
+                                            - 0.5;
+                                        self.viewport.renderer.args.julia.0 =
+                                            ((Complex64::new(mx as f64, my as f64 * ratio as f64)
+                                                / self.viewport.renderer.args.zoom)
+                                                + self.viewport.renderer.args.origin);
+                                        pressed = true;
+                                    }
+                                    if mouse_input.middle_down() {
+                                        self.viewport.renderer.args.julia.1 =
+                                            !self.viewport.renderer.args.julia.1;
+                                        pressed = true;
+                                    }
+                                }
+                                if mouse_input.any_released() {
+                                    self.viewport.last.origin = self.viewport.renderer.args.origin;
+                                }
+                                if self.viewport.active && !self.viewport.renderer.rendering {
+                                    self.viewport.renderer.render(false,1, true);
+                                }
+
+                                image_ctx.request_repaint();
+
+                                if self.viewport.active && self.events.enter.is_some() {
+                                    println!("Rendering Now!");
+                                    self.renderer.clear();
+                                    self.renderer.copy_args(&self.viewport.renderer);
+                                    self.renderer.export_image_with_info(
+                                        false,
+                                        true,
+                                        if let Ok(r) = self.input_menu.samples.parse() {
+                                            Some(r)
+                                        } else {
+                                            Some(self.viewport.renderer.rendered_samples)
+                                        },
+                                        // Some(64),
+                                        None,
+                                        None
+                                    );
+                                    self.renderer.clear();
+                                    println!();
+                                }
+                            } else {
+                                self.viewport_interact = false;
+                            }
+                        });
+                });
+        });
+        if pressed {
+            self.viewport.renderer.clear();
+            self.viewport.renderer.render(false, 1, true);
+        }
+    }
+}
+
+fn custom_window_frame(
+    height: f32,
+    ctx: &egui::Context,
+    frame: &mut eframe::Frame,
+    title: &str,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    ctx.set_visuals(egui::style::Visuals::dark());
+    use egui::*;
+    let text_color = ctx.style().visuals.text_color();
+
+    CentralPanel::default()
+        .frame(Frame::none())
+        .show(ctx, |ui| {
+            let rect = ui.max_rect();
+            let painter = ui.painter();
+
+            // Paint the frame:
+            painter.rect(
+                rect,
+                0.0,
+                ctx.style().visuals.window_fill(),
+                Stroke::new(0.0, text_color),
+            );
+
+            // Paint the title:
+            painter.text(
+                rect.center_top() + vec2(0.0, height / 2.0),
+                Align2::CENTER_CENTER,
+                title,
+                FontId::proportional(height - 4.0),
+                text_color,
+            );
+
+            // Add the close button:
+            let close_response = ui.put(
+                Rect::from_min_size(rect.left_top(), Vec2::splat(height)),
+                Button::new(RichText::new("❌").size(height - 4.0)).frame(false),
+            );
+            if close_response.clicked() {
+                frame.quit();
+            }
+
+            // Interact with the title bar (drag to move window):
+            let title_bar_rect = {
+                let mut rect = rect;
+                rect.max.y = rect.min.y + height;
+                rect
+            };
+            let title_bar_response =
+                ui.interact(title_bar_rect, Id::new("title_bar"), Sense::drag());
+            if title_bar_response.drag_started() {
+                frame.drag_window();
+            }
+
+            // Add the contents:
+            let content_rect = {
+                let mut rect = rect;
+                rect.min.y = title_bar_rect.max.y;
+                rect
+            };
+            // ui.la
+
+            let mut content_ui = ui.child_ui(content_rect, *ui.layout());
+            add_contents(&mut content_ui);
+        });
+}
+
+fn main() {
+    let options = eframe::NativeOptions {
+        // Hide the OS-specific "chrome" around the window:
+        decorated: false,
+        // To have rounded corners we need transparency:
+        transparent: false,
+        min_window_size: Some(egui::vec2(320.0, 100.0)),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "FracgenGUI", // unused title
+        options,
+        Box::new(|_cc| Box::new(FracgenGUI::default())),
+    );
+}
