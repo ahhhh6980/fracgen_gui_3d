@@ -1,5 +1,8 @@
 # fracge_gui_3d
 
+To build:
+`cargo run --release --all-features`
+
 ## My WIP little inefficient and ok DE fractal ray tracer (could be better ofc lol)
 ### `This was not designed to be perfectly user friendly but just for me to play around with`
 
