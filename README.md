@@ -1,4 +1,4 @@
-# fracge_gui_3d
+# fracgen_gui_3d
 
 To build:
 
